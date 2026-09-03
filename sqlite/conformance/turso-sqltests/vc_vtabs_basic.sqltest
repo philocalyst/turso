@@ -1,0 +1,88 @@
+@database :memory:
+
+# vc_vtabs_basic.sqltest
+#
+# Per-table virtual tables are live: `dolt_history_<t>`, `dolt_at_<t>`,
+# `dolt_diff_<t>`, and `dolt_constraint_violations_<t>` declare the real
+# columns of their table, so SELECT reads them directly (B2 proof). A
+# qualified name (`main.dolt_history_t`) resolves too, and a table whose name
+# needs SQL quoting round-trips through the capture path.
+
+test vc-vtabs-history-live-columns {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    INSERT INTO t VALUES (2, 'b');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT count(*) FROM dolt_history_t('HEAD');
+    SELECT id, v FROM dolt_history_t('HEAD');
+    SELECT id, v FROM dolt_at_t('HEAD');
+    SELECT count(*) FROM dolt_constraint_violations_t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\n3\n1\|a\n2\|b\n1\|a\n1\|a\n2\|b\n0$
+}
+
+test vc-vtabs-qualified-name {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT count(*) FROM main.dolt_history_t('HEAD');
+    SELECT id FROM main.dolt_at_t('HEAD');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n1$
+}
+
+test vc-vtabs-diff-live-columns {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    INSERT INTO t VALUES (2, 'b');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT to_id, to_v, diff_type FROM dolt_diff_t('HEAD~1', 'HEAD');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\n2\|b\|added$
+}
+
+test vc-vtabs-weird-table-name {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE "we""ird" (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO "we""ird" VALUES (1, 'a');
+    SELECT dolt_add('we"ird');
+    SELECT dolt_commit('seed');
+    SELECT message FROM dolt_log;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nseed$
+}
+
+test vc-vtabs-constraint-violations-live {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id));
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 99);
+    SELECT dolt_add('child');
+    SELECT dolt_add('parent');
+    SELECT dolt_verify_constraints();
+    SELECT table_name, violation_type FROM dolt_constraint_violations_child;
+    SELECT count(*) FROM dolt_constraint_violations_parent;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n1\n1\nchild\|foreign key\n0$
+}

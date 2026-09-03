@@ -1,0 +1,230 @@
+@database :memory:
+
+# vc_replay_basic.sqltest
+#
+# Cherry-pick, revert, and rebase through the scalar surface, plus the merge
+# drivers `--squash` / `--no-commit` / `--abort`.
+
+test vc-replay-cherry-pick {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_cherry_pick('feature');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n[0-9a-f]{40}\n2$
+}
+
+test vc-replay-revert {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_cherry_pick('feature');
+    SELECT dolt_revert('HEAD');
+    SELECT count(*) FROM t;
+    SELECT message FROM dolt_log LIMIT 1;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n[0-9a-f]{40}\n[0-9a-f]{40}\n1\nRevert "feature work"$
+}
+
+test vc-replay-rebase-onto {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_checkout('feature');
+    SELECT dolt_rebase('--onto', 'main');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\nfeature\n[0-9a-f]{40}\n2$
+}
+
+test vc-replay-rebase-conflict-abort {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    UPDATE t SET v = 'theirs' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    UPDATE t SET v = 'ours' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main work');
+    SELECT dolt_checkout('feature');
+    SELECT dolt_rebase('--onto', 'main');
+    SELECT dolt_rebase('--abort');
+    SELECT count(*) FROM t;
+}
+expect error {
+    rebase conflict at
+}
+
+test vc-replay-merge-squash-and-no-commit {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_merge('feature', '--squash');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n[0-9a-f]{40}\n2$
+}
+
+test vc-replay-merge-no-commit-then-commit {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_merge('feature', '--no-commit');
+    SELECT dolt_commit('finish merge');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n0\n[0-9a-f]{40}\n2$
+}
+
+test vc-replay-merge-abort {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_merge('feature', '--no-commit');
+    SELECT dolt_merge('--abort');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n0\n0\n1$
+}
+
+test vc-replay-no-commit-captures-later-insert {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    SELECT dolt_merge('feature', '--no-commit');
+    INSERT INTO t VALUES (5, 'direct');
+    SELECT dolt_commit('finish');
+    SELECT count(*) FROM t;
+    SELECT id, v FROM dolt_at_t('HEAD');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n0\n[0-9a-f]{40}\n3\n1\|base\n2\|feat\n5\|direct$
+}
+
+test vc-replay-rebase-plan-with-drop {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'first');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('first');
+    INSERT INTO t VALUES (3, 'second');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT dolt_checkout('main');
+    SELECT dolt_checkout('feature');
+    SELECT dolt_rebase('--onto', 'main', '--plan');
+    SELECT dolt_rebase('--plan', 'drop HEAD~1', 'pick HEAD');
+    SELECT dolt_rebase('--continue');
+    SELECT count(*) FROM t;
+    SELECT message FROM dolt_log WHERE message = 'second';
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\nmain\nfeature\n2\n0\n[0-9a-f]{40}\n2\nsecond$
+}
+
+test vc-replay-merge-with-m-parent {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    INSERT INTO t VALUES (2, 'feat');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    INSERT INTO t VALUES (3, 'main');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main work');
+    SELECT dolt_merge('feature');
+    SELECT dolt_merge('HEAD', '-m', '1');
+    SELECT count(*) FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n[0-9a-f]{40}\n[0-9a-f]{40}\n3$
+}

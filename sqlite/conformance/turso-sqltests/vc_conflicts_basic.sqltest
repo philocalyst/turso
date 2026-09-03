@@ -1,0 +1,107 @@
+@database :memory:
+
+# vc_conflicts_basic.sqltest
+#
+# Conflicts are transient: recorded in the working set, visible through
+# `dolt_conflicts`, cleared by resolution, never present in a commit object.
+# Constraint-violation detectors gate commit unless `--force` is given.
+
+test vc-conflicts-transient-and-resolvable {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base'), (2, 'keep');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    UPDATE t SET v = 'theirs' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    UPDATE t SET v = 'ours' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main work');
+    SELECT dolt_merge('feature');
+    SELECT table_name, conflict_type FROM dolt_conflicts;
+    SELECT our_values FROM dolt_conflicts;
+    SELECT dolt_conflicts_resolve('--ours', 't', 1);
+    SELECT dolt_commit('merged');
+    SELECT count(*) FROM dolt_conflicts;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\nmerge conflict: 1 conflicting rows in 1 tables\nt\|rows\n1,ours\n0\n[0-9a-f]{40}\n0$
+}
+
+test vc-constraint-violations-gate-commit {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 99);
+    SELECT dolt_add('child');
+    SELECT dolt_add('parent');
+    SELECT dolt_verify_constraints();
+    SELECT dolt_commit('blocked');
+}
+expect error {
+    cannot commit: constraint violations remain
+}
+
+test vc-constraint-violations-force-commits {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 99);
+    SELECT dolt_add('child');
+    SELECT dolt_add('parent');
+    SELECT dolt_verify_constraints();
+    SELECT dolt_commit('--force', 'forced');
+    SELECT count(*) FROM dolt_constraint_violations;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n1\n1\n[0-9a-f]{40}\n0$
+}
+
+test vc-constraint-violations-table {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent (id));
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 99);
+    SELECT dolt_add('child');
+    SELECT dolt_add('parent');
+    SELECT dolt_verify_constraints();
+    SELECT table_name, violation_type FROM dolt_constraint_violations;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n1\n1\nchild\|foreign key$
+}
+
+test vc-writeback-failure-surfaces-and-rolls-back {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE);
+    INSERT INTO t VALUES (1, 'base'), (2, 'keep');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    UPDATE t SET v = 'x' WHERE id = 1;
+    INSERT INTO t VALUES (3, 'y');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    UPDATE t SET v = 'y' WHERE id = 1;
+    INSERT INTO t VALUES (4, 'x');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main work');
+    SELECT dolt_merge('feature');
+}
+expect error {
+    failed to write working set to SQL
+}
