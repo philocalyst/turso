@@ -10,7 +10,7 @@ use crate::index_method::{
 };
 use crate::schema::{Schema, Table};
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Mutex;
+use crate::sync::{Mutex, Weak};
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
@@ -39,6 +39,9 @@ pub use vtab_xconnect::{execute, prepare_stmt};
 pub struct ExtensionCtx {
     syms: *mut SymbolTable,
     schema: *mut c_void,
+    /// The registering connection, so table-valued-function modules can read
+    /// live columns at create time. Null for database-level registrations.
+    conn: *const turso_ext::Conn,
     /// We must bump the prepare context generation so prepared statements
     /// know they need to be reprepared after extension registration.
     prepare_context_generation: *const AtomicU64,
@@ -75,7 +78,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
         }
 
         if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
+            if let Ok(vtab) = VirtualTable::function(&name_str, syms, ext_ctx.conn) {
                 let table = Arc::new(Table::Virtual(vtab));
                 let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
                 let mut guard = mutex.lock();
@@ -265,6 +268,7 @@ impl Database {
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
+            conn: std::ptr::null(),
             prepare_context_generation: std::ptr::null(),
         }));
         #[allow(unused)]
@@ -306,7 +310,7 @@ impl Database {
 impl Connection {
     /// Register statically linked functions or virtual tables against this
     /// connection using the generic extension API.
-    pub fn register_static_extension<F>(&self, register: F)
+    pub fn register_static_extension<F>(self: &Arc<Connection>, register: F)
     where
         F: FnOnce(&mut ExtensionApi),
     {
@@ -315,6 +319,24 @@ impl Connection {
             register(&mut ext_api);
             self._free_extension_ctx(ext_api);
         }
+    }
+
+    /// Register the per-table version-control vtables (`dolt_history_<t>`,
+    /// `dolt_at_<t>`, `dolt_blame_<t>`, `dolt_diff_<t>`,
+    /// `dolt_conflicts_<t>`, `dolt_constraint_violations_<t>`) for one user
+    /// table. The registration carries this connection, so the modules'
+    /// `create` can declare the table's live columns. Called on first use so
+    /// the table exists by then.
+    pub fn register_vc_table_modules(self: &Arc<Connection>, table: &str) {
+        unsafe {
+            let ext_api = self._build_turso_ext();
+            turso_ext::vc_vtabs::register_table_modules(&ext_api, table);
+            self._free_extension_ctx(ext_api);
+        }
+        // The registration updates the shared schema copy-on-write; planning
+        // reads this connection's schema copy, so adopt the new one or the
+        // just-registered modules stay invisible to the current statement.
+        *self.schema.write() = self.db.schema.lock().clone();
     }
 
     /// Build the connection's extension api context for manually registering an extension.
@@ -334,12 +356,22 @@ impl Connection {
     ///     conn._free_extension_ctx(ext_api);
     /// }
     ///```
-    pub unsafe fn _build_turso_ext(&self) -> ExtensionApi {
+    pub unsafe fn _build_turso_ext(self: &Arc<Connection>) -> ExtensionApi {
         let schema_mutex_ptr =
             &*self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        // A connection handle for table-valued-function modules: create-time
+        // column resolution runs prepared statements against this connection.
+        let weak = Arc::downgrade(self);
+        let weak_box = Box::into_raw(Box::new(weak));
+        let conn = Box::into_raw(Box::new(turso_ext::Conn::new(
+            weak_box as *mut c_void,
+            prepare_stmt,
+            execute,
+        )));
         let ctx = ExtensionCtx {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
+            conn: conn as *const turso_ext::Conn,
             prepare_context_generation: &self.prepare_context_generation as *const _,
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
@@ -365,6 +397,13 @@ impl Connection {
         if api.ctx.is_null() {
             return;
         }
-        let _ = unsafe { Box::from_raw(api.ctx as *mut ExtensionCtx) };
+        let ctx = unsafe { Box::from_raw(api.ctx as *mut ExtensionCtx) };
+        if !ctx.conn.is_null() {
+            // The conn owns its weak-boxed core connection; release both.
+            let conn = unsafe { Box::from_raw(ctx.conn as *mut turso_ext::Conn) };
+            if !conn._ctx.is_null() {
+                let _ = unsafe { Box::from_raw(conn._ctx as *mut Weak<Connection>) };
+            }
+        }
     }
 }

@@ -1144,6 +1144,16 @@ pub fn translate_create_table(
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
+    // Version-control hook: a freshly created table is an uncommitted change
+    // in the connection's working set. Translation time is an over-approximation:
+    // the statement can still fail at execution (e.g. a duplicate table name), so
+    // the tracked name may never exist in the schema. That is fine — the working
+    // set is advisory, and a stale name just reads as an uncommitted change until
+    // it is reset or overwritten.
+    if let Some(vc) = &connection.versioning {
+        vc.track_table(&normalized_tbl_name);
+    }
+
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
         if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
@@ -1676,7 +1686,7 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
         .collect::<Vec<_>>();
     let schema = module
         .implementation
-        .create_schema(ext_args)
+        .create_schema(&vtab.tbl_name.name.as_ident(), ext_args, std::ptr::null())
         .unwrap_or_default();
     let vtab_args = if let Some(first_paren) = schema.find('(') {
         let closing_paren = schema.rfind(')').unwrap_or_default();

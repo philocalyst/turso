@@ -27,6 +27,8 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
         impl #struct_name {
             #[no_mangle]
             unsafe extern "C" fn #create_fn_name(
+                name: *const ::std::ffi::c_char,
+                conn: *const ::turso_ext::Conn,
                 argv: *const ::turso_ext::Value, argc: i32
             ) -> ::turso_ext::VTabCreateResult {
                 let args = if argv.is_null() {
@@ -34,7 +36,13 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 } else {
                     ::std::slice::from_raw_parts(argv, argc as usize)
                 };
-                match <#struct_name as ::turso_ext::VTabModule>::create(&args) {
+                let name = if name.is_null() {
+                    ""
+                } else {
+                    ::std::ffi::CStr::from_ptr(name).to_str().unwrap_or("")
+                };
+                let conn = if conn.is_null() { None } else { Some(&*conn) };
+                match <#struct_name as ::turso_ext::VTabModule>::create_with_conn(name, conn, &args) {
                     Ok((schema, table)) => {
                         ::turso_ext::VTabCreateResult {
                             code: ::turso_ext::ResultCode::OK,

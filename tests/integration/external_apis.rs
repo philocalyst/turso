@@ -307,7 +307,7 @@ fn boxed_scalar_context(multiplier: i64, counters: Arc<CallbackCounters>) -> usi
 
 #[allow(clippy::too_many_arguments)]
 fn register_context_scalar(
-    conn: &Connection,
+    conn: &Arc<Connection>,
     name: &str,
     argc: i32,
     deterministic: bool,
@@ -337,7 +337,7 @@ fn register_context_scalar(
     Ok(())
 }
 
-fn unregister_extension_function(conn: &Connection, name: &str) -> anyhow::Result<()> {
+fn unregister_extension_function(conn: &Arc<Connection>, name: &str) -> anyhow::Result<()> {
     let name = CString::new(name)?;
     let api = unsafe { conn._build_turso_ext() };
     let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
@@ -470,7 +470,7 @@ fn boxed_aggregate_context(counters: Arc<CallbackCounters>) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn register_context_aggregate(
-    conn: &Connection,
+    conn: &Arc<Connection>,
     name: &str,
     argc: i32,
     context: usize,

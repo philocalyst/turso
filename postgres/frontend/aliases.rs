@@ -1,8 +1,9 @@
 use chrono::Utc;
+use std::sync::Arc;
 use turso_core::Connection;
 use turso_ext::{scalar, ExtensionApi, Value as ExtValue};
 
-pub fn install(conn: &Connection) {
+pub fn install(conn: &Arc<Connection>) {
     conn.register_static_extension(register_pg_functions);
 }
 

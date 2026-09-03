@@ -1,7 +1,9 @@
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
-use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
+use turso_ext::{
+    AggCtx, ContextDestructor, FinalizeFunction, ResultCode, StepFunction, ValueDestructor,
+};
 use turso_parser::ast::SortOrder;
 
 use crate::alloc::*;
@@ -739,6 +741,7 @@ impl Value {
                     return Ok(Value::Null);
                 };
                 match err {
+                    (ResultCode::Busy, _) => Err(LimboError::Busy),
                     (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
                     (code, None) => Err(LimboError::ExtensionError(code.to_string())),
                 }
@@ -4867,5 +4870,24 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    #[test]
+    fn ext_busy_error_surfaces_as_limbo_busy() {
+        let ext =
+            ExtValue::error_with_code_message(ResultCode::Busy, "database is locked".to_string());
+        assert!(matches!(Value::from_ffi(ext), Err(LimboError::Busy)));
+    }
+
+    #[test]
+    fn ext_other_error_surfaces_as_extension_error() {
+        let ext = ExtValue::error_with_code_message(
+            ResultCode::CustomError,
+            "table not found: ghost".to_string(),
+        );
+        assert!(matches!(
+            Value::from_ffi(ext),
+            Err(LimboError::ExtensionError(msg)) if msg == "table not found: ghost"
+        ));
     }
 }

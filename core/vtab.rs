@@ -84,11 +84,21 @@ impl VirtualTable {
         })
     }
 
-    pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
+    pub(crate) fn function(
+        name: &str,
+        syms: &SymbolTable,
+        conn: *const turso_ext::Conn,
+    ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
-            ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
-                .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
+            ExtVirtualTable::create(
+                name,
+                module,
+                Vec::new(),
+                VTabKind::TableValuedFunction,
+                conn,
+            )
+            .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
         } else {
             return Err(LimboError::ParseError(format!(
                 "No such table-valued function: {name}"
@@ -114,8 +124,13 @@ impl VirtualTable {
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(module_name);
-        let (table, schema) =
-            ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
+        let (table, schema) = ExtVirtualTable::create(
+            module_name,
+            module,
+            args,
+            VTabKind::VirtualTable,
+            std::ptr::null(),
+        )?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
             columns: Self::resolve_columns(schema)?,
@@ -372,6 +387,7 @@ impl ExtVirtualTable {
         module: Option<&Arc<crate::ext::VTabImpl>>,
         args: Vec<turso_ext::Value>,
         kind: VTabKind,
+        conn: *const turso_ext::Conn,
     ) -> crate::Result<(Self, String)> {
         let module = module.ok_or_else(|| {
             LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
@@ -385,7 +401,7 @@ impl ExtVirtualTable {
                 "{module_name} is not a {expected} module"
             )));
         }
-        let (schema, table_ptr) = module.implementation.create(args)?;
+        let (schema, table_ptr) = module.implementation.create(module_name, args, conn)?;
         let vtab = ExtVirtualTable {
             implementation: module.implementation.clone(),
             table_ptr: AtomicPtr::new(table_ptr as *mut c_void),
@@ -399,11 +415,16 @@ impl ExtVirtualTable {
         // we need a Weak<Connection> to upgrade and call from the extension.
         let weak = Arc::downgrade(&conn);
         let weak_box = Box::into_raw(Box::new(weak));
-        let conn = turso_ext::Conn::new(
+        let mut conn_ext = turso_ext::Conn::new(
             weak_box as *mut c_void,
             crate::ext::prepare_stmt,
             crate::ext::execute,
         );
+        // Hand the cursor the connection's version-control state, if any, so
+        // VC virtual tables read history without a global registry. The clone
+        // keeps the state alive exactly as long as the cursor's connection box.
+        conn_ext.set_versioning(conn.versioning.clone());
+        let conn = conn_ext;
         let ext_conn_ptr = NonNull::new(Box::into_raw(Box::new(conn))).expect("null pointer");
         // store the leaked connection pointer on the table so it can be freed on drop
         let Some(cursor) = NonNull::new(unsafe {

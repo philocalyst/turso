@@ -56,8 +56,9 @@ use crate::{
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 #[cfg(host_shared_wal)]
-use std::path::Path;
+use std::ffi::c_void;
 #[cfg(host_shared_wal)]
+use std::path::Path;
 use std::sync::OnceLock;
 use std::{fmt, ops::Deref};
 #[cfg(feature = "fs")]
@@ -2362,6 +2363,9 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         let page_size = pager.get_page_size_unchecked();
         let encryption_cipher = self.encryption_cipher_mode.get();
+        // Every connection owns its version-control state (VcStore + branch
+        // session); the dolt_* scalar functions are registered against it below.
+        let vc = turso_ext::versioning::VcState::new();
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -2402,6 +2406,8 @@ impl Database {
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
+            versioning: Some(vc.clone()),
+            vc_ext_conn: Mutex::new(None),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
@@ -2445,6 +2451,25 @@ impl Database {
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
+        // The write-path dolt_* shims capture and apply SQL table content, so
+        // the versioning state needs a connection handle that stays valid for
+        // this connection's lifetime.
+        {
+            let weak = Arc::downgrade(&conn);
+            let weak_box = Box::into_raw(Box::new(weak));
+            let ext_conn = Box::new(turso_ext::Conn::new(
+                weak_box as *mut c_void,
+                crate::ext::prepare_stmt,
+                crate::ext::execute,
+            ));
+            let handle = turso_ext::versioning::ConnHandle::new(ext_conn, weak_box as *mut c_void);
+            vc.set_conn(turso_ext::versioning::ConnRef::new(handle.ptr()));
+            *conn.vc_ext_conn.lock() = Some(Box::new(handle));
+        }
+        conn.register_static_extension(|api| {
+            turso_ext::versioning::register_vc_functions(api, vc.clone());
+            turso_ext::vc_vtabs::register_vc_vtabs(api);
+        });
         refresh_analyze_stats(&conn);
         Ok(conn)
     }

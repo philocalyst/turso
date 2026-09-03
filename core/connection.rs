@@ -479,6 +479,14 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     pub(crate) view_transaction_states: AllViewsTxState,
+    /// Per-connection version-control state for the `dolt_*` scalar functions.
+    /// Companion struct owned here (never inside the pager): each connection
+    /// keeps its own active branch, staging set, and detached pin.
+    pub(crate) versioning: Option<Arc<turso_ext::versioning::VcState>>,
+    /// Extension connection handle for the write-path shims, so they can read
+    /// and write the SQL tables. Owned here so the borrowed pointer the state
+    /// keeps stays valid for this connection's lifetime.
+    pub(crate) vc_ext_conn: Mutex<Option<Box<turso_ext::versioning::ConnHandle>>>,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -570,6 +578,15 @@ crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // Release the extension connection handle: the handle itself plus the
+        // boxed Weak<Connection> its _ctx points to.
+        if let Some(handle) = self.vc_ext_conn.lock().take() {
+            let weak_ptr = handle.weak_ptr();
+            drop(handle);
+            if !weak_ptr.is_null() {
+                let _ = unsafe { Box::from_raw(weak_ptr as *mut crate::sync::Weak<Connection>) };
+            }
+        }
         if !self.is_closed() {
             // A handle dropped mid-transaction rolls that transaction back
             // below, so parked index-method cursors must receive the same

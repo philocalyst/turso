@@ -1831,7 +1831,23 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let mut table =
+        resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+
+    // Per-table version-control modules (`dolt_history_<t>` and friends) register
+    // reactively on first use so their create resolves the table's live columns
+    // through this connection. The registration takes the user table name, not
+    // the vtab name, because the module names are `dolt_history_<user table>`.
+    if table.is_none() && connection.versioning.is_some() {
+        if let Some(user_table) = vc_per_table_user_table(&normalized_qualified_name) {
+            connection.register_vc_table_modules(&user_table);
+            // The resolver's schema is a statement-start snapshot that cannot
+            // see the just-registered modules; read the connection's current
+            // schema directly instead.
+            table =
+                connection.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+        }
+    }
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
@@ -2035,6 +2051,20 @@ fn parse_table(
         "no such table: {}",
         crate::util::table_name_for_error(qualified_name)
     );
+}
+
+/// The user table behind a per-table vtab name (`dolt_history_t` -> `t`).
+fn vc_per_table_user_table(name: &str) -> Option<String> {
+    [
+        "dolt_constraint_violations_",
+        "dolt_history_",
+        "dolt_at_",
+        "dolt_blame_",
+        "dolt_diff_",
+        "dolt_conflicts_",
+    ]
+    .iter()
+    .find_map(|prefix| name.strip_prefix(prefix).map(|rest| rest.to_string()))
 }
 
 fn transform_args_into_where_terms(
