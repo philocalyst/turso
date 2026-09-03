@@ -1486,6 +1486,33 @@ mod tests {
     }
 
     #[test]
+    fn arg_to_value_preserves_null_pk_cells() {
+        assert_eq!(arg_to_value(&FuncArg::Null), VcValue::Null);
+        assert_eq!(arg_to_value(&FuncArg::Integer(7)), VcValue::Integer(7));
+        assert_eq!(
+            arg_to_value(&FuncArg::Text("k")),
+            VcValue::Text("k".to_string())
+        );
+    }
+
+    #[test]
+    fn conflicts_resolve_with_null_pk_reaches_store() {
+        // A NULL primary-key cell is a real key: the resolve must not silently
+        // drop the argument, or the store would look up an empty key.
+        let (mut s, feature) = seed_divergent();
+        dolt_merge(&mut s, &[FuncArg::Text(&feature)]).unwrap();
+        s.conflicts[0].pk = vec![VcValue::Null];
+        // The store still resolves by the NULL key; a wrong side is what
+        // errors, proving the NULL cell was passed through untouched.
+        assert!(dolt_conflicts_resolve(
+            &mut s,
+            &[FuncArg::Text("--ours"), FuncArg::Text("t"), FuncArg::Null],
+        )
+        .is_ok());
+        assert!(s.conflicts.is_empty());
+    }
+
+    #[test]
     fn verify_constraints_counts_and_gates_commit() {
         let (mut s, _feature) = seed_clean_feature();
         // Introduce a duplicate primary-key value in the working set.

@@ -84,7 +84,13 @@ If O1 traits are absent, define minimal local traits in `model.rs`
 
 ## Status
 
-- [ ] v1 implemented (nemotron)
-- [ ] reviewer pass 1 (muse-spark)
-- [ ] v2/v3 fixes
-- [ ] green: fmt + clippy + cargo test + sqltests
+- [x] v1 implemented (nemotron) — 125 tests green, reviewer verdict NEEDS-V2
+- [x] reviewer pass 1 (muse-spark) — 16-item delta (8 must-fix)
+- [x] v2 fixes (nemotron) — full-DAG LCA, trailing-byte reject, tracked clean,
+  -A end-to-end, detached state, status/reset/clean/tag surface, CORE-WIRE
+  ScalarFunc registration; reviewer pass 2 verdict NEEDS-V3 (F-A Busy code,
+  F-B chunk compat)
+- [x] v3 fixes (nemotron) — F-A Busy→SQLITE_BUSY end-to-end, F-B xxhash32
+  split predicate restored; reviewer pass 3 verdict GREEN
+- [x] green: fmt + clippy (turso_versioning, turso_ext) + cargo test +
+  sqltests (12/12 vc_branch_basic + vc_commit_gate via run-rust)
