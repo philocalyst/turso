@@ -293,7 +293,27 @@ New:
 
 ## Status
 
-- [ ] v1 implemented — _fill on landing_
-- [ ] reviewer pass 1 — _verdict_
-- [ ] v2/v3 fixes — _verdict_
-- [ ] green: fmt + clippy + cargo test + sqltests — _paste outputs_
+- [x] v1 implemented
+- [x] reviewer pass 1 — RED with B1-B6
+- [x] v2/v3 fixes — all B1-B6 resolved
+- [x] O4 re-review fixes — B3 restore-on-failure, B4 ours-deleted schema-conflict, merge_schema deletion-is-conflict, union_columns O(n²) cleanup
+- [x] O4 final nits — merge_schema comment/message fixes, O(1) HashSet, dead code removal
+
+### Fix Log
+
+- B1: `merge_schema.rs:92-124` single-side delete now checks base for modification
+- B2: `merge_schema.rs:196-285` CHECK constraints included in classify/same_schema/union_columns
+- B3: `versioning.rs:155-195` outer SAVEPOINT wraps sync_work_to_sql; dirty flags + pending_resolve restored on failure for retry consistency
+- B4: `replay.rs:750-763` schema-conflicted tables keep ours-side image in work; ours-deleted + theirs-modified records schema conflict with theirs_schema preserved
+- B5: clippy clean for turso_versioning + turso_ext; workspace turso_core lints pre-existing
+- B6: removed root RUBRIC_O4.md duplicate and *.snap.new files
+- O4-fix1: `merge_schema.rs:94-122` ours-deleted arm: distinguishes unchanged/modified theirs + absent. Mirror arm `merge_schema.rs:126-140` theirs-deleted: distinguishes unchanged/modified ours (symmetric).
+- O4-fix2: `merge_schema.rs:197-211` replaced `Vec` with `HashSet` for theirs_new so the `O(1)` lookup claim in the comment is correct.
+- O4-fix3: `staging.rs:207-219` + `versioning.rs:165-191` write-back failure restores drained pending_resolve and dirty flags for retry consistency
+
+## Validation
+
+- `cargo test -p turso_versioning`: **342 passed**, 0 failed
+- `cargo fmt --check`: **clean**
+- `cargo clippy -p turso_versioning --all-features --all-targets -- --deny=warnings`: **zero warnings** (workspace turso_core lints pre-existing)
+- `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'`: **1647 passed**, 341 skipped — vc subset PASS

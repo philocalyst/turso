@@ -5,6 +5,8 @@
 //! `--ours`/`--theirs`. Rebuilds generate merged `CREATE TABLE` SQL with
 //! base-order columns followed by ours-added then theirs-added.
 
+use std::collections::HashSet;
+
 /// One column of a parsed `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColIR {
@@ -92,15 +94,53 @@ pub fn merge_schema(
     let ours = match ours {
         Some(o) => o,
         None => {
-            return match theirs {
-                Some(t) => SchemaDecision::Clean(t.clone()),
-                None => SchemaDecision::Conflict("table deleted on both sides".to_string()),
-            }
+            return match (base, theirs) {
+                (None, Some(t)) => SchemaDecision::Clean(t.clone()),
+                (None, None) => SchemaDecision::Conflict("table deleted on both sides".to_string()),
+                // Base existed, ours deleted it, theirs still exists.
+                (Some(b), Some(t)) => {
+                    if same_schema(t, b) {
+                        // Theirs didn't change the table: deletion still
+                        // conflicts because theirs expects it to exist.
+                        SchemaDecision::Conflict(
+                            "table deleted on ours, unchanged on theirs".to_string(),
+                        )
+                    } else {
+                        // Theirs modified the table: conflict.
+                        SchemaDecision::Conflict(
+                            "table deleted on ours, modified on theirs".to_string(),
+                        )
+                    }
+                }
+                // Base existed, ours deleted it, theirs is absent:
+                // conflict — we cannot tell whether theirs deleted it
+                // cleanly or never had it, so refuse.
+                (Some(_), None) => {
+                    SchemaDecision::Conflict("table deleted on ours, absent on theirs".to_string())
+                }
+            };
         }
     };
     let theirs = match theirs {
         Some(t) => t,
-        None => return SchemaDecision::Clean(ours.clone()),
+        None => {
+            return match base {
+                None => SchemaDecision::Clean(ours.clone()),
+                // Base existed, theirs deleted it, ours is present:
+                // distinguish whether ours modified the table from base.
+                Some(b) => {
+                    if same_schema(ours, b) {
+                        SchemaDecision::Conflict(
+                            "table deleted on theirs, unchanged on ours".to_string(),
+                        )
+                    } else {
+                        SchemaDecision::Conflict(
+                            "table deleted on theirs, modified on ours".to_string(),
+                        )
+                    }
+                }
+            };
+        }
     };
     let base = match base {
         Some(b) => b,
@@ -139,7 +179,8 @@ pub fn merge_schema(
 }
 
 /// Both sides only added columns: union them, refusing same-name columns with
-/// different decls.
+/// different decls. Table-level constraints are also unioned; differing
+/// constraint additions conflict.
 fn union_columns(base: &SchemaIR, ours: &SchemaIR, theirs: &SchemaIR) -> SchemaDecision {
     let ours_added = added_columns(base, ours);
     let theirs_added = added_columns(base, theirs);
@@ -153,12 +194,52 @@ fn union_columns(base: &SchemaIR, ours: &SchemaIR, theirs: &SchemaIR) -> SchemaD
             }
         }
     }
+    // Pre-compute new constraints on each side. theirs_new_set is a
+    // HashSet so `contains` is O(1) instead of re-scanning theirs on each
+    // iteration of ours_new.
+    let ours_new: Vec<&str> = ours
+        .constraints
+        .iter()
+        .filter(|c| !base.constraints.contains(c))
+        .map(|s| s.as_str())
+        .collect();
+    let theirs_new_set: HashSet<&str> = theirs
+        .constraints
+        .iter()
+        .filter(|c| !base.constraints.contains(c))
+        .map(|s| s.as_str())
+        .collect();
+
+    let mut constraints = base.constraints.clone();
+    for c in &ours_new {
+        if !constraints.iter().any(|x| x == *c) {
+            if theirs_new_set.contains(*c) {
+                // Both sides added the same constraint: keep it.
+                constraints.push(c.to_string());
+            } else if !theirs_new_set.is_empty() {
+                // Ours added a constraint theirs doesn't have, and theirs
+                // also added different constraints: conflict.
+                return SchemaDecision::Conflict(
+                    "conflicting constraint additions on both sides".to_string(),
+                );
+            } else {
+                // Ours added a constraint theirs doesn't have and theirs
+                // added nothing new: ours-only addition, keep it.
+                constraints.push(c.to_string());
+            }
+        }
+    }
+    for c in &theirs_new_set {
+        if !constraints.iter().any(|x| x == *c) {
+            constraints.push(c.to_string());
+        }
+    }
     SchemaDecision::Clean(SchemaIR {
         table: base.table.clone(),
         columns: merged_columns(base, &ours_added, &theirs_added),
         pk: base.pk.clone(),
         sql: base.sql.clone(),
-        constraints: base.constraints.clone(),
+        constraints,
         strict: base.strict,
     })
 }
@@ -192,7 +273,7 @@ fn added_columns(base: &SchemaIR, side: &SchemaIR) -> Vec<ColIR> {
 }
 
 /// Classify one side's change against base: nothing, additive-only, or
-/// breaking (drop/rename/type change/PK change/not-null add).
+/// breaking (drop/rename/type change/PK change/not-null add/constraint removal).
 fn classify(side: &SchemaIR, base: &SchemaIR) -> SideChange {
     if same_schema(side, base) {
         return SideChange::Unchanged;
@@ -202,6 +283,20 @@ fn classify(side: &SchemaIR, base: &SchemaIR) -> SideChange {
     }
     if side.strict != base.strict {
         return SideChange::Breaking;
+    }
+    // Constraint removal is breaking; constraint addition is compatible.
+    if side.constraints.len() < base.constraints.len() {
+        return SideChange::Breaking;
+    }
+    // Modified constraints (same count, different content) are breaking.
+    if side.constraints.len() == base.constraints.len() {
+        let mut a: Vec<&str> = side.constraints.iter().map(|s| s.as_str()).collect();
+        let mut b: Vec<&str> = base.constraints.iter().map(|s| s.as_str()).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            return SideChange::Breaking;
+        }
     }
     if side.columns.len() < base.columns.len() {
         return SideChange::Breaking;
@@ -223,9 +318,20 @@ fn classify(side: &SchemaIR, base: &SchemaIR) -> SideChange {
     SideChange::Compatible
 }
 
-/// Byte-level schema equality: columns, decls, pk order, strict flag.
+/// Byte-level schema equality: columns, decls, pk order, strict flag,
+/// and table-level constraints.
 pub fn same_schema(a: &SchemaIR, b: &SchemaIR) -> bool {
     if a.strict != b.strict || a.pk != b.pk {
+        return false;
+    }
+    if a.constraints.len() != b.constraints.len() {
+        return false;
+    }
+    let mut a_cons: Vec<&str> = a.constraints.iter().map(|s| s.as_str()).collect();
+    let mut b_cons: Vec<&str> = b.constraints.iter().map(|s| s.as_str()).collect();
+    a_cons.sort_unstable();
+    b_cons.sort_unstable();
+    if a_cons != b_cons {
         return false;
     }
     if a.columns.len() != b.columns.len() {
@@ -873,5 +979,123 @@ mod tests {
         assert!(rebuilt.contains(
             "CREATE TABLE \"t\" (\"id\" INTEGER PRIMARY KEY, \"v\" TEXT, \"a\" TEXT, \"b\" TEXT)"
         ));
+    }
+
+    #[test]
+    fn b1_delete_on_ours_unmodified_on_theirs_is_gone() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let theirs = base.clone();
+        let decision = merge_schema(Some(&base), None, Some(&theirs));
+        assert!(matches!(decision, SchemaDecision::Conflict(_)));
+        assert_eq!(
+            decision,
+            SchemaDecision::Conflict("table deleted on ours, unchanged on theirs".to_string())
+        );
+    }
+
+    #[test]
+    fn b1_delete_on_ours_modified_on_theirs_conflicts() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let theirs = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, extra TEXT)",
+        );
+        let decision = merge_schema(Some(&base), None, Some(&theirs));
+        assert!(matches!(decision, SchemaDecision::Conflict(_)));
+        assert_eq!(
+            decision,
+            SchemaDecision::Conflict("table deleted on ours, modified on theirs".to_string())
+        );
+    }
+
+    #[test]
+    fn b1_delete_on_theirs_unmodified_on_ours_is_gone() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let ours = base.clone();
+        let decision = merge_schema(Some(&base), Some(&ours), None);
+        assert!(matches!(decision, SchemaDecision::Conflict(_)));
+        assert_eq!(
+            decision,
+            SchemaDecision::Conflict("table deleted on theirs, unchanged on ours".to_string())
+        );
+    }
+
+    #[test]
+    fn b1_delete_on_theirs_modified_on_ours_conflicts() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let ours = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, extra TEXT)",
+        );
+        let decision = merge_schema(Some(&base), Some(&ours), None);
+        assert!(matches!(decision, SchemaDecision::Conflict(_)));
+        assert_eq!(
+            decision,
+            SchemaDecision::Conflict("table deleted on theirs, modified on ours".to_string())
+        );
+    }
+
+    #[test]
+    fn b1_no_base_added_on_theirs_only_takes_theirs() {
+        let theirs = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let decision = merge_schema(None, None, Some(&theirs));
+        assert_eq!(decision, SchemaDecision::Clean(theirs.clone()));
+    }
+
+    #[test]
+    fn b1_no_base_added_on_ours_only_takes_ours() {
+        let ours = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let decision = merge_schema(None, Some(&ours), None);
+        assert_eq!(decision, SchemaDecision::Clean(ours.clone()));
+    }
+
+    #[test]
+    fn b2_add_check_on_one_side_is_compatible() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let ours = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, CHECK (id > 0))",
+        );
+        let decision = merge_schema(Some(&base), Some(&ours), Some(&base));
+        assert!(matches!(decision, SchemaDecision::Clean(_)));
+    }
+
+    #[test]
+    fn b2_differing_check_constraints_conflict() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let ours = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, CHECK (id > 0))",
+        );
+        let theirs = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, CHECK (id > 1))",
+        );
+        let decision = merge_schema(Some(&base), Some(&ours), Some(&theirs));
+        assert!(matches!(decision, SchemaDecision::Conflict(_)));
+    }
+
+    #[test]
+    fn b2_both_added_same_check_takes_base_with_check() {
+        let base = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+        let ours = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, CHECK (id > 0))",
+        );
+        let theirs = ir(
+            "t",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, CHECK (id > 0))",
+        );
+        let decision = merge_schema(Some(&base), Some(&ours), Some(&theirs));
+        match decision {
+            SchemaDecision::Clean(merged) => {
+                assert!(
+                    merged.constraints.iter().any(|c| c.contains("CHECK")),
+                    "merged should contain the CHECK constraint, got {:?}",
+                    merged.constraints
+                );
+            }
+            _ => panic!("expected clean"),
+        }
     }
 }
