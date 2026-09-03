@@ -152,6 +152,11 @@ impl VcState {
     /// merge/replay/resolve so `SELECT * FROM t` reflects the merged state;
     /// plain commits leave SQL and work identical, so no-op there. The pending
     /// resolutions are drained here so the map cannot grow unboundedly.
+    ///
+    /// The whole write-back is wrapped in an SQL SAVEPOINT so a failure on any
+    /// table rolls back every table to the pre-write-back state. On store-side
+    /// failure the dirty tables are restored (the SQL tables were rolled back,
+    /// so the store must re-attempt the full write on the next call).
     pub fn sync_work_to_sql(&self) -> VersionResult<()> {
         let Some(conn) = self.with_conn(|c| c as *const _) else {
             return Ok(());
@@ -161,11 +166,29 @@ impl VcState {
             let mut store = self.store.lock().unwrap();
             (store.take_pending_resolve(), store.take_work_changes())
         };
-        for (table, pk, image) in resolutions {
-            apply_resolution_image(conn, &table, &pk, image.as_ref())?;
-        }
-        for (table, snap) in changes {
-            write_table(conn, &table, &snap)?;
+        // Save copies so a write-back failure can restore the drained state.
+        let saved_resolutions = resolutions.clone();
+        let dirty_names: Vec<String> = changes.iter().map(|(t, _)| t.clone()).collect();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let connection = Arc::new(crate::Connection::new(conn as *const crate::vtabs::Conn));
+        execute_sql(&connection, "SAVEPOINT turso_vc_sync", Vec::new())?;
+        let result = sync_write_back(&connection, &resolutions, &changes);
+        match result {
+            Ok(()) => {
+                execute_sql(&connection, "RELEASE turso_vc_sync", Vec::new())?;
+            }
+            Err(e) => {
+                let _ = execute_sql(&connection, "ROLLBACK TO turso_vc_sync", Vec::new());
+                let _ = execute_sql(&connection, "RELEASE turso_vc_sync", Vec::new());
+                // Restore the drained pending-resolve and dirty flags so a
+                // retry can re-attempt the write-back. The SQL tables are
+                // rolled back by the SAVEPOINT; the store working set is the
+                // source of truth and must remain retryable.
+                let mut store = self.store.lock().unwrap();
+                store.restore_pending_resolve(saved_resolutions);
+                store.restore_dirty_work(dirty_names);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -526,25 +549,16 @@ fn read_table(conn: &crate::vtabs::Conn, table: &str) -> VersionResult<TableCapt
 }
 
 /// Replace one table's SQL content with the snapshot: drop the old rows (or
-/// create the table from its schema) and insert the new ones. The whole
-/// rewrite runs inside a savepoint, so a failing insert rolls back the delete
-/// too — the SQL table never ends up half-rewritten.
+/// Write one table's snapshot directly, without a per-table SAVEPOINT.
+/// The caller (sync_write_back) holds an outer SAVEPOINT that covers the
+/// whole write-back, so a failure here rolls back every table atomically.
 #[allow(clippy::arc_with_non_send_sync)]
-fn write_table(
-    conn: &crate::vtabs::Conn,
+fn write_table_snapshot(
+    connection: &Arc<crate::Connection>,
     table: &str,
     snap: &turso_versioning::staging::TableSnapshot,
 ) -> VersionResult<()> {
-    let connection = Arc::new(crate::Connection::new(conn as *const crate::vtabs::Conn));
-    execute_sql(&connection, "SAVEPOINT turso_vc_write", Vec::new())?;
-    let result = write_table_body(&connection, table, snap);
-    if result.is_ok() {
-        execute_sql(&connection, "RELEASE turso_vc_write", Vec::new())?;
-    } else {
-        let _ = execute_sql(&connection, "ROLLBACK TO turso_vc_write", Vec::new());
-        let _ = execute_sql(&connection, "RELEASE turso_vc_write", Vec::new());
-    }
-    result
+    write_table_body(connection, table, snap)
 }
 
 /// The delete-or-create and insert steps of a table rewrite.
@@ -603,22 +617,50 @@ fn write_table_body(
     Ok(())
 }
 
-/// Apply one resolved conflict's row image to the SQL table: delete the row
-/// the key names, then insert the winning side's image (or nothing when the
-/// winning side deleted the row).
-#[allow(clippy::arc_with_non_send_sync)]
-fn apply_resolution_image(
-    conn: &crate::vtabs::Conn,
+/// Write-back helper: apply resolutions then write dirty tables. Called from
+/// within the outer SAVEPOINT of `sync_work_to_sql`.
+fn sync_write_back(
+    connection: &Arc<crate::Connection>,
+    resolutions: &[(String, Vec<VcValue>, Option<VcRow>)],
+    changes: &[(String, turso_versioning::staging::TableSnapshot)],
+) -> VersionResult<()> {
+    for (table, pk, image) in resolutions {
+        apply_resolution_image_conn(connection, table, pk, image.as_ref())?;
+    }
+    for (table, snap) in changes {
+        write_table_snapshot(connection, table, snap)?;
+    }
+    Ok(())
+}
+
+/// Apply one resolved conflict's row image using an existing connection,
+/// for use inside the outer SAVEPOINT of `sync_work_to_sql`.
+fn apply_resolution_image_conn(
+    connection: &Arc<crate::Connection>,
     table: &str,
     pk: &[VcValue],
     image: Option<&VcRow>,
 ) -> VersionResult<()> {
-    let connection = Arc::new(crate::Connection::new(conn as *const crate::vtabs::Conn));
-    let cols = read_table(conn, table)?;
-    let pk_cols: Vec<&String> = cols.1.iter().collect();
-    let positions: Vec<usize> = pk_cols
+    let mut stmt = connection
+        .prepare(&format!("PRAGMA table_info({})", quote_ident(table)))
+        .map_err(|_| VersionError::WorkWrite(format!("resolve image for {table}")))?;
+    let mut columns = Vec::new();
+    let mut pk_ranked: Vec<(usize, String)> = Vec::new();
+    while let crate::StepResult::Row = stmt.step() {
+        let row = stmt.get_row();
+        if let Some(name) = row.get(1).and_then(|v| v.to_text_coerced()) {
+            columns.push(name.clone());
+            let rank = row.get(5).and_then(|v| v.to_integer()).unwrap_or(0) as usize;
+            if rank > 0 {
+                pk_ranked.push((rank, name));
+            }
+        }
+    }
+    pk_ranked.sort_by_key(|(rank, _)| *rank);
+    let pk_names: Vec<String> = pk_ranked.into_iter().map(|(_, name)| name).collect();
+    let positions: Vec<usize> = pk_names
         .iter()
-        .filter_map(|name| cols.0.iter().position(|c| c == *name))
+        .filter_map(|name| columns.iter().position(|c| c == name))
         .collect();
     if positions.len() != pk.len() {
         return Err(VersionError::WorkWrite(format!(
@@ -634,21 +676,20 @@ fn apply_resolution_image(
         .join(" AND ");
     let delete = format!("DELETE FROM {} WHERE {}", quote_ident(table), where_clause);
     let pk_args: Vec<Value> = pk.iter().map(vc_to_value).collect();
-    execute_sql(&connection, &delete, pk_args)?;
+    execute_sql(connection, &delete, pk_args)?;
     if let Some(image) = image {
-        let cols_list = cols
-            .0
+        let cols_list = columns
             .iter()
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ");
-        let placeholders = vec!["?"; cols.0.len()].join(", ");
+        let placeholders = vec!["?"; columns.len()].join(", ");
         let insert = format!(
             "INSERT INTO {} ({cols_list}) VALUES ({placeholders})",
             quote_ident(table)
         );
         let args: Vec<Value> = image.values.iter().map(vc_to_value).collect();
-        execute_sql(&connection, &insert, args)?;
+        execute_sql(connection, &insert, args)?;
     }
     Ok(())
 }

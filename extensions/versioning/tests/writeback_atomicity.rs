@@ -84,3 +84,50 @@ fn writeback_failure_rolls_back_whole_table() {
     );
     assert_eq!(count(&conn, "SELECT count(*) FROM t"), before);
 }
+
+/// Two-table write-back: a merge that touches two tables where the second
+/// table's write-back fails.  The outer SAVEPOINT must roll back both tables,
+/// not just the failing one — the first table's SQL must revert too.
+#[test]
+fn two_table_writeback_failure_rolls_back_both() {
+    let conn = connect();
+    // Table a has no unique constraint on v; table b does.
+    for stmt in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT UNIQUE)",
+        "INSERT INTO a VALUES (1, 'base')",
+        "INSERT INTO b VALUES (1, 'base')",
+    ] {
+        exec(&conn, stmt).expect("setup");
+    }
+    exec(&conn, "SELECT dolt_config('user.name', 'Ada')").unwrap();
+    exec(&conn, "SELECT dolt_config('user.email', 'ada@example.com')").unwrap();
+    exec(&conn, "SELECT dolt_add('a', 'b')").unwrap();
+    exec(&conn, "SELECT dolt_commit('seed')").unwrap();
+    // feature adds rows to both tables.
+    exec(&conn, "SELECT dolt_branch('feature')").unwrap();
+    exec(&conn, "SELECT dolt_checkout('feature')").unwrap();
+    exec(&conn, "INSERT INTO a VALUES (2, 'feat_a')").unwrap();
+    exec(&conn, "INSERT INTO b VALUES (2, 'feat_b')").unwrap();
+    exec(&conn, "SELECT dolt_add('a', 'b')").unwrap();
+    exec(&conn, "SELECT dolt_commit('feature work')").unwrap();
+    // main adds rows to both tables with the same v value on table b as
+    // feature added, creating a UNIQUE violation in the merged working set.
+    exec(&conn, "SELECT dolt_checkout('main')").unwrap();
+    exec(&conn, "INSERT INTO a VALUES (3, 'main_a')").unwrap();
+    exec(&conn, "INSERT INTO b VALUES (3, 'feat_b')").unwrap();
+    exec(&conn, "SELECT dolt_add('a', 'b')").unwrap();
+    exec(&conn, "SELECT dolt_commit('main work')").unwrap();
+    let a_before = count(&conn, "SELECT count(*) FROM a");
+    let b_before = count(&conn, "SELECT count(*) FROM b");
+    // The merge is clean (no row conflicts), but the merged working set for
+    // table b contains two rows with v='feat_b' (id=2 from feature, id=3
+    // from main), violating the UNIQUE index during write-back.
+    let err = exec(&conn, "SELECT dolt_merge('feature')").expect_err("merge must fail");
+    assert!(
+        err.contains("failed to write working set to SQL"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(count(&conn, "SELECT count(*) FROM a"), a_before);
+    assert_eq!(count(&conn, "SELECT count(*) FROM b"), b_before);
+}

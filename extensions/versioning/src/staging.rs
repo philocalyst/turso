@@ -202,6 +202,23 @@ impl VcStore {
         self.dirty_work.extend(tables.iter().cloned());
     }
 
+    /// Restore pending conflict resolutions drained before a failed write-back
+    /// so a retry can re-attempt applying them to SQL.
+    pub fn restore_pending_resolve(&mut self, entries: Vec<(String, Vec<VcValue>, Option<VcRow>)>) {
+        for (table, pk, image) in entries {
+            self.pending_resolve
+                .entry(table)
+                .or_default()
+                .insert(pk, image);
+        }
+    }
+
+    /// Restore dirty flags drained before a failed write-back so the next
+    /// `take_work_changes` call can re-attempt the write-back.
+    pub fn restore_dirty_work(&mut self, tables: Vec<String>) {
+        self.dirty_work.extend(tables);
+    }
+
     /// Move tables into the staged set (merge/replay apply them to the working
     /// SQL set, so a follow-up `dolt_commit` picks them up).
     pub(crate) fn stage_names(&mut self, tables: &[String]) {
@@ -1099,5 +1116,56 @@ mod tests {
             s.resolve("WORKING").unwrap_err().to_string(),
             "invalid revision spec: 'WORKING'"
         );
+    }
+
+    #[test]
+    fn pending_resolve_survives_writeback_failure() {
+        use crate::conflicts::ConflictEntry;
+        use crate::conflicts::ConflictKind;
+        let mut s = configured_store();
+        // Simulate a merge that recorded a conflict.
+        s.conflicts.push(ConflictEntry {
+            table: "t1".to_string(),
+            pk: vec![crate::vtab_log::VcValue::Integer(1)],
+            base: Some(crate::vtab_log::VcRow::new(vec![
+                crate::vtab_log::VcValue::Integer(1),
+                crate::vtab_log::VcValue::Text("b".into()),
+            ])),
+            ours: Some(crate::vtab_log::VcRow::new(vec![
+                crate::vtab_log::VcValue::Integer(1),
+                crate::vtab_log::VcValue::Text("o".into()),
+            ])),
+            theirs: Some(crate::vtab_log::VcRow::new(vec![
+                crate::vtab_log::VcValue::Integer(1),
+                crate::vtab_log::VcValue::Text("t".into()),
+            ])),
+            kind: ConflictKind::Rows,
+            ours_schema: None,
+            theirs_schema: None,
+        });
+        // Resolve the conflict so it lands in pending_resolve.
+        s.resolve_conflict(
+            "t1",
+            &[crate::vtab_log::VcValue::Integer(1)],
+            crate::conflicts::ResolveSide::Ours,
+        )
+        .unwrap();
+        assert!(s.conflicts.is_empty());
+        // Drain the pending resolve and dirty set (mimics take before write-back).
+        let resolutions = s.take_pending_resolve();
+        let changes = s.take_work_changes();
+        assert!(!resolutions.is_empty());
+        // Simulate a write-back failure: restore the drained state.
+        let dirty_names: Vec<String> = changes.iter().map(|(t, _)| t.clone()).collect();
+        s.restore_pending_resolve(resolutions);
+        s.restore_dirty_work(dirty_names);
+        // Both must be retryable: pending_resolve is repopulated and dirty_work
+        // is set so the next take_work_changes call returns the same tables.
+        assert!(!s.pending_resolve.is_empty());
+        let retry = s.take_work_changes();
+        assert_eq!(retry.len(), changes.len());
+        // The restored pending resolve drains cleanly on retry.
+        let retry_res = s.take_pending_resolve();
+        assert_eq!(retry_res.len(), 1);
     }
 }

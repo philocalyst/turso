@@ -750,6 +750,12 @@ pub(crate) fn merge_snapshots(
         match merge_schema(b_ir.as_ref(), o_ir.as_ref(), t_ir.as_ref()) {
             SchemaDecision::Conflict(detail) => {
                 stat.schema_conflict = true;
+                // Keep ours-side image in work so the table doesn't vanish
+                // during a schema conflict; the user resolves by
+                // --ours/--theirs which restores the chosen side fully.
+                if let Some(o) = o {
+                    work.insert(name.clone(), o.clone());
+                }
                 conflicts.push(ConflictEntry {
                     table: name.clone(),
                     pk: Vec::new(),
@@ -1567,5 +1573,80 @@ mod tests {
         let commit = s.commits.get_commit(&new_head).unwrap();
         assert_eq!(commit.meta.message, "first\n\nsecond");
         assert_eq!(commit.parents, vec![main_tip]);
+    }
+
+    #[test]
+    fn ours_deleted_theirs_survives_in_schema_conflict() {
+        let mut s = configured_store();
+        // Seed: base has table "t" with schema SQL.
+        s.apply_work(
+            "t",
+            vec!["id".to_string(), "v".to_string()],
+            vec!["id".to_string()],
+            vec![VcRow::new(vec![
+                VcValue::Integer(1),
+                VcValue::Text("base".into()),
+            ])],
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
+        );
+        let seed = commit_work(&mut s, "seed");
+        s.create_branch("feature").unwrap();
+        // Feature modifies the table (adds a column).
+        s.checkout("feature").unwrap();
+        s.apply_work(
+            "t",
+            vec!["id".to_string(), "v".to_string(), "extra".to_string()],
+            vec!["id".to_string()],
+            vec![VcRow::new(vec![
+                VcValue::Integer(1),
+                VcValue::Text("base".into()),
+                VcValue::Text("feat".into()),
+            ])],
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, extra TEXT)".to_string(),
+        );
+        commit_work(&mut s, "feature work");
+        // Main drops the table and creates a commit without "t", so the
+        // merge base (seed) has "t" but main's HEAD snapshot does not.
+        s.checkout("main").unwrap();
+        s.work.remove("t");
+        // Add a dummy table so there's something to commit.
+        s.apply_work(
+            "dummy",
+            vec!["id".to_string()],
+            vec!["id".to_string()],
+            vec![VcRow::new(vec![VcValue::Integer(1)])],
+            String::new(),
+        );
+        if !s.tables().contains(&"dummy".to_string()) {
+            s.track_table("dummy");
+        }
+        let main_tables: Vec<String> = s.work_tables_content();
+        s.dolt_add(&main_tables.iter().map(|t| t.as_str()).collect::<Vec<_>>())
+            .unwrap();
+        s.set_now(10);
+        s.dolt_commit("drop t", None, false, false).unwrap();
+        // Merge feature into main: base(seed) has "t", main deleted it,
+        // theirs modified it → schema conflict.
+        let result = s.merge_branch("feature", false, false, None);
+        match result.unwrap() {
+            MergeResult::SchemaConflict { table, detail } => {
+                assert_eq!(table, "t");
+                assert!(detail.contains("table deleted on ours"));
+            }
+            other => panic!("expected schema conflict, got {other:?}"),
+        }
+        // The conflict entry carries theirs_schema so --theirs can restore it.
+        let entries = s.conflict_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].theirs_schema.is_some(),
+            "theirs_schema must be preserved for --theirs resolution"
+        );
+        let theirs_snap = entries[0].theirs_schema.as_ref().unwrap();
+        assert!(
+            theirs_snap.schema_sql.contains("extra"),
+            "theirs schema must carry the modified table"
+        );
+        let _ = seed;
     }
 }
