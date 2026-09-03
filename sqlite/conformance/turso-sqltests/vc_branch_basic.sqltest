@@ -1,0 +1,76 @@
+@database :memory:
+
+# vc_branch_basic.sqltest
+#
+# Branch create/checkout/active/list/delete and hashof through the scalar
+# surface. The `dolt_*` scalar functions are registered per-connection by the
+# core wire (extensions/versioning/src/funcs.rs CORE-WIRE block).
+
+test vc-branch-create-checkout-active {
+    SELECT dolt_branch('feature');
+    SELECT dolt_active_branch();
+    SELECT dolt_checkout('feature');
+    SELECT dolt_active_branch();
+}
+expect {
+    feature
+    main
+    feature
+    feature
+}
+
+test vc-branch-list-and-delete {
+    SELECT dolt_branch('feature');
+    SELECT dolt_branch();
+    SELECT dolt_branch('-d', 'feature');
+    SELECT dolt_branch();
+}
+expect {
+    feature
+    feature
+    main
+    feature
+    main
+}
+
+test vc-branch-already-exists {
+    SELECT dolt_branch('main');
+}
+expect error {
+    branch 'main' already exists
+}
+
+test vc-branch-missing-delete {
+    SELECT dolt_branch('-d', 'nope');
+}
+expect error {
+    branch not found: nope
+}
+
+test vc-hashof-head-and-ancestor {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed1');
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed2');
+    SELECT dolt_hashof('main');
+    SELECT dolt_hashof('main~1');
+}
+expect pattern {
+    (?m)^[0-9a-f]{40}$\n^[0-9a-f]{40}$
+}
+
+test vc-detached-requires-qualified-path {
+    -- dolt_checkout() never enters detached state: a detached HEAD comes only
+    -- from opening a qualified path (my.db/<hash> or my.db/<tag>), which the
+    -- scalar surface cannot reach. The active branch stays attached here, so
+    -- dolt_active_branch() is never NULL.
+    SELECT dolt_checkout('main');
+    SELECT dolt_active_branch() IS NULL;
+}
+expect {
+    main
+    0
+}

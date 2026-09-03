@@ -28,6 +28,7 @@ pub struct Chunk {
 
 pub struct WeibullChunker {
     buffer: Vec<u8>,
+    front: usize,
     chunks: Vec<Chunk>,
     level: u32,
 }
@@ -47,6 +48,7 @@ impl WeibullChunker {
         assert!(level <= 32);
         WeibullChunker {
             buffer: Vec::with_capacity(Self::MAX),
+            front: 0,
             chunks: Vec::new(),
             level,
         }
@@ -66,17 +68,17 @@ impl WeibullChunker {
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
 
-        while self.buffer.len() >= Self::MAX {
+        while self.buffer.len() - self.front >= Self::MAX {
             self.split_at_level(self.level);
         }
     }
 
-    /// Returns any remaining buffered data without emitting a chunk.
+    /// Tail merged across pushes, below the split threshold; `finish` emits it.
     pub fn remaining(&self) -> &[u8] {
-        &self.buffer
+        &self.buffer[self.front..]
     }
 
-    /// Chunks already emitted by `push`; the `finish` tail is never counted.
+    /// Counts only what `push` split, never the tail `finish` emits.
     pub fn push_emitted_len(&self) -> usize {
         self.chunks.len()
     }
@@ -85,44 +87,58 @@ impl WeibullChunker {
     /// emits chunks in `[MIN, MAX]`; this tail may be smaller than `MIN`
     /// because an undersized remainder is merged across pushes, never emitted.
     pub fn finish(mut self) -> Vec<Chunk> {
-        if !self.buffer.is_empty() {
-            let hash = blake3_chunk_hash(&self.buffer);
+        if self.front < self.buffer.len() {
+            let hash = blake3_chunk_hash(&self.buffer[self.front..]);
             self.chunks.push(Chunk {
                 hash,
-                data: std::mem::take(&mut self.buffer),
+                data: self.buffer[self.front..].to_vec(),
             });
         }
         self.chunks
     }
 
     fn split_at_level(&mut self, level: u32) {
-        let start = 0;
+        // The caller only invokes this with a full buffer (len - front >= MAX),
+        // so the scan always ends in a forced MAX split even if no hash boundary
+        // fires.
+        let start = self.front;
+        let limit = self.buffer.len() - 32;
+        let mut i = start + Self::MIN;
         let mut found = false;
 
-        for i in (start + Self::MIN)..=(self.buffer.len() - 32) {
-            let window = &self.buffer[i..i + 32];
-            let h = xxhash32(window, 0);
-            if split_decision(h, level) || i >= start + Self::MAX {
-                let chunk_data: Vec<u8> = self.buffer.drain(start..i).collect();
-                let hash = blake3_chunk_hash(&chunk_data);
+        while i <= limit {
+            if i >= start + Self::MAX || split_decision(xxhash32(&self.buffer[i..i + 32], 0), level)
+            {
+                let hash = blake3_chunk_hash(&self.buffer[start..i]);
                 self.chunks.push(Chunk {
                     hash,
-                    data: chunk_data,
+                    data: self.buffer[start..i].to_vec(),
                 });
+                self.front = i;
                 found = true;
                 break;
             }
+            i += 1;
         }
 
         // Undersized tail stays in buffer across pushes — merged, not emitted as a
         // sub-minimum chunk. The caller must call finish() to emit any remainder.
-        if !found && self.buffer.len() >= Self::MAX {
-            let chunk_data: Vec<u8> = self.buffer.drain(start..start + Self::MAX).collect();
-            let hash = blake3_chunk_hash(&chunk_data);
+        if !found && self.buffer.len() - self.front >= Self::MAX {
+            let end = self.front + Self::MAX;
+            let hash = blake3_chunk_hash(&self.buffer[self.front..end]);
             self.chunks.push(Chunk {
                 hash,
-                data: chunk_data,
+                data: self.buffer[self.front..end].to_vec(),
             });
+            self.front = end;
+        }
+
+        // Consumed-prefix bytes are dropped once the front cursor passes the
+        // midpoint, so each byte is memmoved at most twice in total (amortized
+        // linear instead of quadratic across chunk splits).
+        if self.front >= self.buffer.len() / 2 {
+            self.buffer.drain(0..self.front);
+            self.front = 0;
         }
     }
 }
@@ -426,14 +442,19 @@ pub fn xxhash32(data: &[u8], seed: u32) -> u32 {
     h32 = h32.wrapping_add(len as u32);
 
     while index + 4 <= len {
+        // Standard xxHash32 folds word*P3 into the accumulator before the
+        // rotation (doltlite prollyXXH32 agrees); multiplying the running sum
+        // instead would diverge on any input that reaches this loop.
         h32 = h32
-            .wrapping_add(u32::from_le_bytes([
-                data[index],
-                data[index + 1],
-                data[index + 2],
-                data[index + 3],
-            ]))
-            .wrapping_mul(PRIME3)
+            .wrapping_add(
+                u32::from_le_bytes([
+                    data[index],
+                    data[index + 1],
+                    data[index + 2],
+                    data[index + 3],
+                ])
+                .wrapping_mul(PRIME3),
+            )
             .rotate_left(17)
             .wrapping_mul(PRIME4);
         index += 4;
@@ -458,7 +479,9 @@ pub fn xxhash32(data: &[u8], seed: u32) -> u32 {
 
 #[inline]
 fn round(acc: u32, input: u32) -> u32 {
-    acc.wrapping_add(input.wrapping_mul(PRIME4))
+    // The 16-byte-block lane uses input*PRIME2, not PRIME4: standard xxHash32
+    // and doltlite prollyXXH32 agree, and the vendored golden vectors pin it.
+    acc.wrapping_add(input.wrapping_mul(PRIME2))
         .rotate_left(13)
         .wrapping_mul(PRIME1)
 }
@@ -467,12 +490,88 @@ fn round(acc: u32, input: u32) -> u32 {
 mod tests {
     use super::*;
 
+    fn mixed_payload(len: usize) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+            .collect()
+    }
+
     #[test]
     fn chunk_blake3_known_vector() {
         let h = blake3_chunk_hash(b"");
         let expected_hex = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9";
         let expected = ChunkHash::from_hex(expected_hex).unwrap();
         assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn chunk_blake3_1mib_deterministic() {
+        let data = vec![0xABu8; 1024 * 1024];
+        assert_eq!(blake3_chunk_hash(&data), blake3_chunk_hash(&data));
+    }
+
+    #[test]
+    fn chunk_blake3_prefix_differs() {
+        // Truncation to 20 bytes must not lose sensitivity: two 1 MiB inputs that
+        // differ only in the last byte hash to different chunks.
+        let a = vec![0u8; 1024 * 1024];
+        let mut b = a.clone();
+        *b.last_mut().unwrap() = 1;
+        assert_ne!(blake3_chunk_hash(&a), blake3_chunk_hash(&b));
+    }
+
+    #[test]
+    fn chunk_xxhash32_doltlite_golden() {
+        // Vendored from doltlite test/prolly_chunker_boundary_test.c
+        // (master 5c67114c0374): prollyXXH32(seed 0) over the 8-byte big-endian
+        // encoding of integer keys 0..31. Same primes and mixing as our xxhash32.
+        let expected: [u32; 32] = [
+            0xdeb39513, 0xf414a945, 0xd53c8ecb, 0xea0bee70, 0xf8cdd998, 0x17d5f46a, 0xb2edcb43,
+            0x87a9925e, 0xa3301e1d, 0x4c537cb4, 0x8b4174dd, 0x5ece03f1, 0xbb28819c, 0x52f7a644,
+            0x867ce427, 0xfd624c39, 0x15d91f09, 0x9efb9836, 0xd2b74cf3, 0x7d456185, 0xeaabb43d,
+            0xa3f424a0, 0xff4b9b11, 0x0817d47a, 0x10d28df6, 0x08ab1330, 0x14c039bd, 0x04d7fa0e,
+            0xe76e2dbd, 0x74e636d9, 0x3119a83e, 0xf5b8a0e0,
+        ];
+        for (key, want) in expected.iter().enumerate() {
+            assert_eq!(xxhash32(&(key as u64).to_be_bytes(), 0), *want, "key {key}");
+        }
+        // The C test only pins <16-byte inputs (8-byte keys), which never reach
+        // the 16-byte-block round(). Pin the block path too so the byte-for-byte
+        // parity claim is tested: canonical xxHash32 values (prollyXXH32 is a
+        // verbatim port), cross-checked against twox-hash 1.x.
+        let block = (0u8..16).collect::<Vec<u8>>();
+        assert_eq!(xxhash32(&block, 0), 0xb72837f4, "bytes 0..15");
+        assert_eq!(xxhash32(&[0xABu8; 32], 0), 0xed4004c7, "32x0xAB");
+        assert_eq!(xxhash32(b"Hello, world!", 0), 0x31b7405d);
+    }
+
+    #[test]
+    fn chunk_weibull_boundary_golden() {
+        // Golden boundary offsets for a 64 KiB mixed payload at level 10, gated
+        // by the doltlite-parity xxhash32 decision rule (each 32-byte window
+        // hashed with xxhash32(window, 0); split iff hash < 1 << (32-level)).
+        // Level 10 is chosen because the correct hash fires both hash splits and
+        // one forced MAX split and leaves a finish tail, so every branch of the
+        // chunker is pinned. (The default level 12 fires no hash split on this
+        // structured payload, so it would only pin the forced-split path.) The
+        // doltlite tie for the hash itself lives in chunk_xxhash32_doltlite_golden.
+        let payload = mixed_payload(64 * 1024);
+        let mut chunker = WeibullChunker::with_level(10);
+        chunker.push(&payload);
+        let emitted = chunker.push_emitted_len();
+        let chunks = chunker.finish();
+
+        let expected_boundaries = [
+            2374, 4829, 7284, 9739, 12194, 14649, 17104, 19559, 22014, 24469, 26924, 29379, 31834,
+            34289, 36744, 39199, 41654, 44109, 60493,
+        ];
+        assert_eq!(emitted, expected_boundaries.len());
+        let mut offset = 0usize;
+        for (chunk, want) in chunks[..emitted].iter().zip(expected_boundaries) {
+            offset += chunk.data.len();
+            assert_eq!(offset, want, "chunk boundary offset mismatch");
+        }
+        assert_eq!(chunks[emitted].data.len(), 5043, "finish tail");
     }
 
     #[test]

@@ -1,0 +1,107 @@
+@database :memory:
+
+# vc_log_basic.sqltest
+#
+# Commit history through `dolt_log`: newest-first order, `a..b` / `a...b`
+# TVF slices, single-revision reads, and exact errors.
+
+test vc-log-newest-first {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('first');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT committer, message FROM dolt_log;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\nAda\|second\nAda\|first$
+}
+
+test vc-log-two-dot-range {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('base');
+    SELECT dolt_branch('dev');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main-work');
+    SELECT dolt_checkout('dev');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('dev-work');
+    SELECT message FROM dolt_log('main..dev');
+    SELECT message FROM dolt_log('dev..main');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\n1\n[0-9a-f]{40}\ndev\n1\n[0-9a-f]{40}\ndev-work\nmain-work$
+}
+
+test vc-log-three-dot-range {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('base');
+    SELECT dolt_branch('side');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main-work');
+    SELECT dolt_checkout('side');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('side-work');
+    SELECT message FROM dolt_log('main...side');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nside\n1\n[0-9a-f]{40}\nside\n1\n[0-9a-f]{40}\nside-work$
+}
+
+test vc-log-single-revision {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('first');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT message FROM dolt_log('HEAD~1');
+    SELECT count(*) FROM dolt_log;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\nfirst\n2$
+}
+
+test vc-log-unknown-branch {
+    SELECT * FROM dolt_log('nope');
+}
+expect error {
+    branch not found: nope
+}
+
+test vc-log-hash-probe {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('first');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT message FROM dolt_log WHERE commit_hash = (SELECT commit_hash FROM dolt_log LIMIT 1);
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\nsecond$
+}
+
+test vc-log-bad-spec {
+    SELECT * FROM dolt_log('HEAD~x');
+}
+expect error {
+    invalid revision spec: 'HEAD~x'
+}
+
+test vc-log-empty-store {
+    SELECT count(*) FROM dolt_log;
+}
+expect {
+    0
+}

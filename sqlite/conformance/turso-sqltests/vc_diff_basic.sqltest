@@ -1,0 +1,90 @@
+@database :memory:
+
+# vc_diff_basic.sqltest
+#
+# Unscoped diffs through `dolt_diff`: STAGED/WORKING pseudo-commits from the
+# staging sets, empty history diffs, and the metadata-only stat/summary/
+# schema-diff/patch surfaces (row snapshots arrive with O4).
+
+test vc-diff-working-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT commit_hash, table_name, data_change FROM dolt_diff;
+}
+expect {
+    WORKING|t|1
+}
+
+test vc-diff-staged-row {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT commit_hash, table_name, data_change FROM dolt_diff;
+}
+expect {
+    1
+    STAGED|t|1
+}
+
+test vc-diff-clean-after-commit {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT count(*) FROM dolt_diff;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1$
+}
+
+test vc-diff-empty-store {
+    SELECT count(*) FROM dolt_diff;
+}
+expect {
+    0
+}
+
+test vc-diff-table-probe {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT commit_hash, table_name FROM dolt_diff WHERE table_name = 't';
+    SELECT count(*) FROM dolt_diff WHERE table_name = 'ghost';
+}
+expect {
+    1
+    STAGED|t
+    0
+}
+
+test vc-diff-stat-empty {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT count(*) FROM dolt_diff_stat('HEAD', 'HEAD');
+    SELECT count(*) FROM dolt_diff_summary('HEAD', 'HEAD');
+    SELECT count(*) FROM dolt_schema_diff('HEAD', 'HEAD');
+    SELECT count(*) FROM dolt_patch('HEAD', 'HEAD');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n0\n0\n0$
+}
+
+test vc-diff-stat-bad-ref {
+    SELECT * FROM dolt_diff_stat('nope', 'HEAD');
+}
+expect error {
+    branch not found: nope
+}
+
+test vc-diff-patch-single-range {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT count(*) FROM dolt_patch('HEAD~0..HEAD');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0$
+}

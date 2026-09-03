@@ -1,0 +1,77 @@
+@database :memory:
+
+# vc_commit_gate.sqltest
+#
+# Add/commit/status, the commit gates, reset, and hashof determinism through
+# the scalar surface. The conflict gate is exercised at the Rust level; the
+# merge surface is out of scope here.
+#
+# The `dolt_*` scalar functions are registered per-connection by the core wire
+# (extensions/versioning/src/funcs.rs CORE-WIRE block).
+
+test vc-commit-nothing-to-commit {
+    SELECT dolt_commit('empty commit');
+}
+expect error {
+    nothing to commit
+}
+
+test vc-commit-requires-author {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('no author set');
+}
+expect error {
+    invalid author: user.name and user.email must be set
+}
+
+test vc-commit-happy-path {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('add t1');
+    SELECT dolt_active_branch();
+}
+expect pattern {
+    [0-9a-f]{40}\nmain$
+}
+
+test vc-commit-status-labels {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_status();
+}
+expect {
+    Ada
+    ada@example.com
+    1
+    t1|1|new table
+}
+
+test vc-reset-soft-unstages {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_reset();
+    SELECT dolt_status();
+}
+expect {
+    Ada
+    ada@example.com
+    1
+    0
+    t1|0|modified
+}
+
+test vc-hashof-determinism {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_hashof_table('t1');
+    SELECT dolt_hashof_table('t1');
+}
+expect pattern {
+    ^[0-9a-f]{40}\n[0-9a-f]{40}$
+}

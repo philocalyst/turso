@@ -18,7 +18,11 @@ bench = []
 codspeed = ["bench"]
 
 [dependencies]
-blake3 = { version = "1.5.5", features = ["pure"] }
+# `pure` was disabling the SIMD build entirely (1 MiB hashing capped at ~914
+# MiB/s). Default features auto-enable NEON C on aarch64; `neon` is a marker
+# feature that also pins the intent for other ARM targets.
+blake3 = { version = "1.5.5", features = ["neon"] }
+sha2 = "0.10"
 thiserror = "2.0.16"
 hex = "0.4"
 
@@ -27,6 +31,8 @@ tempfile = "3.20.0"
 criterion = { workspace = true, features = ["html_reports"] }
 codspeed-criterion-compat = { workspace = true, features = ["html_reports"] }
 turso_macros.workspace = true
+turso = { path = "../../bindings/rust" }
+futures = "0.3"
 
 [[bench]]
 name = "versioning_bench"

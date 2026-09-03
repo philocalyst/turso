@@ -1,0 +1,54 @@
+@database :memory:
+
+# vc_history_basic.sqltest
+#
+# Branch-scoped views through `dolt_schemas` (fully live: views and triggers
+# read from the schema) and history anchored on `dolt_log`.
+#
+# Per-table vtables (`dolt_history_<t>`, `dolt_at_<t>`, `dolt_blame_<t>`,
+# `dolt_diff_<t>`) are pure-complete in `extensions/versioning` (tested in
+# Rust over `MemVcRead`) and get engine modules with O4: their `create` path
+# needs column metadata that only the table owner can supply.
+
+test vc-schemas-view-and-trigger {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    CREATE VIEW v AS SELECT id FROM t;
+    CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;
+    SELECT type, name FROM dolt_schemas;
+}
+expect {
+    trigger|trg
+    view|v
+}
+
+test vc-schemas-type-filter {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    CREATE VIEW v AS SELECT id FROM t;
+    SELECT name FROM dolt_schemas WHERE type = 'view';
+    SELECT count(*) FROM dolt_schemas WHERE type = 'trigger';
+}
+expect {
+    v
+    0
+}
+
+test vc-schemas-empty {
+    SELECT count(*) FROM dolt_schemas;
+}
+expect {
+    0
+}
+
+test vc-history-anchored-on-log {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t');
+    SELECT dolt_commit('first');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('second');
+    SELECT message FROM dolt_log WHERE committer = 'Ada';
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\nsecond\nfirst$
+}

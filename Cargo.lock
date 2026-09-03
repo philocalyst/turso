@@ -7173,6 +7173,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.2",
  "turso_macros",
+ "turso_versioning",
 ]
 
 [[package]]
@@ -7480,9 +7481,12 @@ dependencies = [
  "blake3",
  "codspeed-criterion-compat",
  "criterion",
+ "futures",
  "hex",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.16",
+ "turso",
  "turso_macros",
 ]
 
