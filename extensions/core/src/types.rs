@@ -477,8 +477,8 @@ impl Value {
     }
 
     /// Creates a new error Value from a ResultCode and a message
-    pub fn error_with_message(message: String) -> Self {
-        let err_value = ErrValue::new_with_message(ResultCode::CustomError, message);
+    pub fn error_with_code_message(code: ResultCode, message: String) -> Self {
+        let err_value = ErrValue::new_with_message(code, message);
         let err_box = Box::new(err_value);
         Self {
             value_type: ValueType::Error,
@@ -486,6 +486,11 @@ impl Value {
                 error: Box::into_raw(err_box) as *const ErrValue,
             },
         }
+    }
+
+    /// Creates a new error Value with a CustomError ResultCode and a message
+    pub fn error_with_message(message: String) -> Self {
+        Self::error_with_code_message(ResultCode::CustomError, message)
     }
 
     /// Creates a new blob Value from a Vec<u8>

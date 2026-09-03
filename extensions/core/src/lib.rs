@@ -1,5 +1,11 @@
 mod functions;
 mod types;
+pub mod vc_vtabs;
+pub mod versioning;
+// Lets the derive macros (`::turso_ext::...` paths) resolve inside this
+// crate. Without it only external extension crates could derive modules,
+// which would force the VC glue out of the crate that owns `VcState`.
+extern crate self as turso_ext;
 #[cfg(feature = "vfs")]
 mod vfs_modules;
 mod vtabs;

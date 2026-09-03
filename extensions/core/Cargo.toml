@@ -14,6 +14,7 @@ static = []
 
 [dependencies]
 turso_macros = { workspace = true }
+turso_versioning = { path = "../versioning" }
 
 getrandom = { workspace = true }
 chrono = { workspace = true, default-features = true }

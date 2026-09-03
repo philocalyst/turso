@@ -48,8 +48,16 @@ pub struct VTabCreateResult {
 
 #[cfg(feature = "core_only")]
 impl VTabModuleImpl {
-    pub fn create(&self, args: Vec<Value>) -> crate::ExtResult<(String, *const c_void)> {
-        let result = unsafe { (self.create)(args.as_ptr(), args.len() as i32) };
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn create(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+        conn: *const Conn,
+    ) -> crate::ExtResult<(String, *const c_void)> {
+        let cname = CString::new(name).unwrap_or_default();
+        let result =
+            unsafe { (self.create)(cname.as_ptr(), conn, args.as_ptr(), args.len() as i32) };
         for arg in args {
             unsafe { arg.__free_internal_type() };
         }
@@ -67,8 +75,13 @@ impl VTabModuleImpl {
     //       However, storing column names is not necessary to match SQLite's behavior.
     //       SQLite computes the list of columns dynamically each time the `.schema` command
     //       is executed, using the `shell_add_schema` UDF function.
-    pub fn create_schema(&self, args: Vec<Value>) -> crate::ExtResult<String> {
-        self.create(args).and_then(|(schema, table)| {
+    pub fn create_schema(
+        &self,
+        name: &str,
+        args: Vec<Value>,
+        conn: *const Conn,
+    ) -> crate::ExtResult<String> {
+        self.create(name, args, conn).and_then(|(schema, table)| {
             // Drop the allocated table instance to avoid a memory leak.
             let result = unsafe { (self.destroy)(table) };
             if result.is_ok() {
@@ -80,7 +93,12 @@ impl VTabModuleImpl {
     }
 }
 
-pub type VtabFnCreate = unsafe extern "C" fn(args: *const Value, argc: i32) -> VTabCreateResult;
+pub type VtabFnCreate = unsafe extern "C" fn(
+    name: *const c_char,
+    conn: *const Conn,
+    args: *const Value,
+    argc: i32,
+) -> VTabCreateResult;
 
 pub type VtabFnOpen =
     unsafe extern "C" fn(table: *const c_void, conn: *const Conn) -> *const c_void;
@@ -141,6 +159,18 @@ pub trait VTabModule: 'static {
     /// Creates a new instance of a virtual table.
     /// Returns a tuple where the first element is the table's schema.
     fn create(args: &[Value]) -> Result<(String, Self::Table), ResultCode>;
+
+    /// Like `create`, but with the registered module name and the connection
+    /// so a per-table table-valued function can declare live columns of a user
+    /// table. `name` carries the table for `dolt_history_<t>`-style modules;
+    /// the connection is `None` when no statement is in flight.
+    fn create_with_conn(
+        _name: &str,
+        _conn: Option<&Conn>,
+        args: &[Value],
+    ) -> Result<(String, Self::Table), ResultCode> {
+        Self::create(args)
+    }
 }
 
 pub trait VTable {
@@ -448,6 +478,10 @@ pub struct Conn {
     pub _ctx: *mut c_void,
     pub _prepare_stmt: PrepareStmtFn,
     pub _execute: ExecuteFn,
+    /// Owning reference to the connection's version-control state, set by
+    /// core when the cursor opens. Extensions read it; core owns it.
+    /// `None` for non-VC connections and in unit tests.
+    pub _versioning: Option<Arc<crate::versioning::VcState>>,
 }
 
 impl Conn {
@@ -456,7 +490,14 @@ impl Conn {
             _ctx: ctx,
             _prepare_stmt: prepare_stmt,
             _execute: exec_fn,
+            _versioning: None,
         }
+    }
+
+    /// Attach the connection's version-control state. Called once by core
+    /// when opening a cursor; the clone keeps the state alive for the cursor.
+    pub fn set_versioning(&mut self, vc: Option<Arc<crate::versioning::VcState>>) {
+        self._versioning = vc;
     }
 
     /// # Safety
@@ -526,6 +567,12 @@ impl Connection {
         Connection(ctx)
     }
 
+    /// The wrapped raw connection pointer, for helpers that reach the core
+    /// connection directly.
+    pub fn conn_ptr(&self) -> *const Conn {
+        self.0
+    }
+
     /// From the included SQL string, prepare a statement for execution.
     pub fn prepare(self: &Arc<Self>, sql: &str) -> ExtResult<Statement> {
         let stmt = unsafe { (*self.0).prepare_stmt(sql) };
@@ -542,6 +589,15 @@ impl Connection {
             return Err(ResultCode::Error);
         }
         unsafe { (*self.0).execute(sql, args) }
+    }
+
+    /// The version-control state of the connection that opened the vtable,
+    /// if this is a VC connection. Glue cursors read history through this.
+    pub fn versioning(self: &Arc<Self>) -> Option<Arc<crate::versioning::VcState>> {
+        if self.0.is_null() {
+            return None;
+        }
+        unsafe { (*self.0)._versioning.clone() }
     }
 }
 
