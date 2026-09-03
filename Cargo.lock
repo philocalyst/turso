@@ -7474,6 +7474,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_versioning"
+version = "0.8.0-pre.7"
+dependencies = [
+ "blake3",
+ "codspeed-criterion-compat",
+ "criterion",
+ "hex",
+ "tempfile",
+ "thiserror 2.0.16",
+ "turso_macros",
+]
+
+[[package]]
 name = "turso_whopper"
 version = "0.8.0-pre.7"
 dependencies = [

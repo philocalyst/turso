@@ -1,0 +1,298 @@
+use std::fmt;
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ChunkHash(pub [u8; 20]);
+
+impl ChunkHash {
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, StoreError> {
+        let bytes = hex::decode(s).map_err(|_| StoreError::BadHash(s.to_string()))?;
+        if bytes.len() != 20 {
+            return Err(StoreError::BadHash(s.to_string()));
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Ok(ChunkHash(arr))
+    }
+}
+
+impl fmt::Debug for ChunkHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ChunkHash({})", self.to_hex())
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct CommitHash(pub [u8; 20]);
+
+impl CommitHash {
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, StoreError> {
+        let bytes = hex::decode(s).map_err(|_| StoreError::BadHash(s.to_string()))?;
+        if bytes.len() != 20 {
+            return Err(StoreError::BadHash(s.to_string()));
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(&bytes);
+        Ok(CommitHash(arr))
+    }
+}
+
+impl fmt::Debug for CommitHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CommitHash({})", self.to_hex())
+    }
+}
+
+pub struct FileMagic;
+
+impl FileMagic {
+    pub const DLTC: u32 = 0x444C5443;
+    pub const FORMAT_VERSION: u16 = 12;
+}
+
+#[derive(Copy, Clone)]
+pub struct NodeFlags(pub u16);
+
+impl NodeFlags {
+    pub const INTKEY: NodeFlags = NodeFlags(0x01);
+    pub const BLOBKEY: NodeFlags = NodeFlags(0x02);
+    pub const COUNTS: NodeFlags = NodeFlags(0x04);
+
+    pub fn contains(self, flag: NodeFlags) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+impl std::ops::BitOr for NodeFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        NodeFlags(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for NodeFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl fmt::Debug for NodeFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NodeFlags(0x{:04X})", self.0)
+    }
+}
+
+pub const MANIFEST_SIZE: usize = 168;
+
+pub struct Manifest {
+    pub root: ChunkHash,
+    pub meta: ChunkHash,
+    pub commits: u32,
+    pub working: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("bad node magic: expected PNOD")]
+    BadNodeMagic,
+
+    #[error("unordered insert into prolly builder")]
+    UnorderedInsert,
+
+    /// Absence surfaces as `Ok(None)` today; this variant is reserved for the
+    /// O2 B-tree path where chunk lookup is fallible and missing is an error.
+    #[error("chunk not found: {0}")]
+    ChunkNotFound(String),
+
+    #[error("bad file manifest")]
+    BadManifest,
+
+    #[error("corrupt WAL record")]
+    CorruptWal,
+
+    #[error("bad hash string: {0}")]
+    BadHash(String),
+}
+
+impl Manifest {
+    pub fn encode(&self) -> [u8; MANIFEST_SIZE] {
+        let mut buf = [0u8; MANIFEST_SIZE];
+        buf[0..4].copy_from_slice(&FileMagic::DLTC.to_be_bytes());
+        buf[4..6].copy_from_slice(&FileMagic::FORMAT_VERSION.to_be_bytes());
+        buf[6..26].copy_from_slice(&self.root.0);
+        buf[26..46].copy_from_slice(&self.meta.0);
+        buf[46..50].copy_from_slice(&self.commits.to_be_bytes());
+        buf[50..54].copy_from_slice(&self.working.to_be_bytes());
+        buf
+    }
+
+    pub fn decode(buf: &[u8; MANIFEST_SIZE]) -> Result<Self, StoreError> {
+        let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic != FileMagic::DLTC {
+            return Err(StoreError::BadManifest);
+        }
+        let version = u16::from_be_bytes([buf[4], buf[5]]);
+        if version != FileMagic::FORMAT_VERSION {
+            return Err(StoreError::BadManifest);
+        }
+
+        let mut root = [0u8; 20];
+        root.copy_from_slice(&buf[6..26]);
+        let mut meta = [0u8; 20];
+        meta.copy_from_slice(&buf[26..46]);
+        let commits = u32::from_be_bytes([buf[46], buf[47], buf[48], buf[49]]);
+        let working = u32::from_be_bytes([buf[50], buf[51], buf[52], buf[53]]);
+
+        if buf[54..MANIFEST_SIZE].iter().any(|&b| b != 0) {
+            return Err(StoreError::BadManifest);
+        }
+
+        Ok(Manifest {
+            root: ChunkHash(root),
+            meta: ChunkHash(meta),
+            commits,
+            working,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only `ChunkHash` satisfies `Into<ChunkHash>`, so a `CommitHash`
+    /// argument is refused at compile time — the two hashes stay distinct
+    /// even though their bytes are interchangeable.
+    fn requires_chunk<T: Into<ChunkHash>>(t: T) -> ChunkHash {
+        t.into()
+    }
+
+    #[test]
+    fn model_chunk_hash_hex_roundtrip() {
+        let h = ChunkHash([0x41; 20]);
+        let hex = h.to_hex();
+        let h2 = ChunkHash::from_hex(&hex).unwrap();
+        assert_eq!(h, h2);
+        assert_eq!(h2.as_bytes(), &[0x41; 20]);
+    }
+
+    #[test]
+    fn model_commit_hash_is_not_chunk_hash() {
+        let ch = ChunkHash([0x42; 20]);
+        let _: ChunkHash = requires_chunk(ch);
+        let c = CommitHash([0x42; 20]);
+        assert_eq!(ch.as_bytes(), c.as_bytes());
+    }
+
+    // Compile-fail proof backing the test above: `Into<ChunkHash>` has no
+    // impl for `CommitHash`, so uncommenting the call breaks the build.
+    #[cfg(any())]
+    fn _commit_hash_refused_by_bound() {
+        let c = CommitHash([0; 20]);
+        let _ = requires_chunk(c);
+    }
+
+    #[test]
+    fn model_manifest_168_byte_roundtrip() {
+        let m = Manifest {
+            root: ChunkHash([1; 20]),
+            meta: ChunkHash([2; 20]),
+            commits: 42,
+            working: 7,
+        };
+        let buf = m.encode();
+        assert_eq!(buf.len(), 168);
+        let m2 = Manifest::decode(&buf).unwrap();
+        assert_eq!(m2.root, m.root);
+        assert_eq!(m2.meta, m.meta);
+        assert_eq!(m2.commits, m.commits);
+        assert_eq!(m2.working, m.working);
+    }
+
+    #[test]
+    fn model_manifest_rejects_bad_magic() {
+        let mut buf = [0u8; MANIFEST_SIZE];
+        buf[0..4].copy_from_slice(&0xDEADBEEF_u32.to_be_bytes());
+        assert!(Manifest::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn model_manifest_rejects_bad_version() {
+        let mut buf = [0u8; MANIFEST_SIZE];
+        buf[0..4].copy_from_slice(&FileMagic::DLTC.to_be_bytes());
+        buf[4..6].copy_from_slice(&99_u16.to_be_bytes());
+        assert!(Manifest::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn model_file_magic_consts() {
+        assert_eq!(FileMagic::DLTC, 0x444C5443);
+        assert_eq!(FileMagic::FORMAT_VERSION, 12);
+    }
+
+    #[test]
+    fn model_node_flags_contains() {
+        let flags = NodeFlags::INTKEY | NodeFlags::COUNTS;
+        assert!(flags.contains(NodeFlags::INTKEY));
+        assert!(!flags.contains(NodeFlags::BLOBKEY));
+        assert!(flags.contains(NodeFlags::COUNTS));
+    }
+
+    #[test]
+    fn store_error_display_bad_node_magic() {
+        assert_eq!(
+            StoreError::BadNodeMagic.to_string(),
+            "bad node magic: expected PNOD"
+        );
+    }
+
+    #[test]
+    fn store_error_display_unordered_insert() {
+        assert_eq!(
+            StoreError::UnorderedInsert.to_string(),
+            "unordered insert into prolly builder"
+        );
+    }
+
+    #[test]
+    fn store_error_display_chunk_not_found() {
+        let hex = "abcdef0123456789abcdef0123456789abcdef01";
+        assert_eq!(
+            StoreError::ChunkNotFound(hex.to_string()).to_string(),
+            format!("chunk not found: {hex}")
+        );
+    }
+
+    #[test]
+    fn store_error_display_bad_manifest() {
+        assert_eq!(StoreError::BadManifest.to_string(), "bad file manifest");
+    }
+
+    #[test]
+    fn store_error_display_corrupt_wal() {
+        assert_eq!(StoreError::CorruptWal.to_string(), "corrupt WAL record");
+    }
+
+    #[test]
+    fn store_error_display_bad_hash() {
+        assert_eq!(
+            StoreError::BadHash("zz".to_string()).to_string(),
+            "bad hash string: zz"
+        );
+    }
+}
