@@ -29,6 +29,7 @@ pub mod merge;
 pub mod merge_schema;
 pub mod model;
 pub mod refs;
+pub mod remote_wire;
 pub mod replay;
 pub mod session;
 pub mod staging;

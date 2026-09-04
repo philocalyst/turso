@@ -256,6 +256,108 @@ pub enum VersionError {
 
     #[error("failed to write working set to SQL: {0}")]
     WorkWrite(String),
+
+    #[error("usage: dolt_remote(action, name [, url])")]
+    UsageDoltRemote,
+
+    #[error("action and name required")]
+    ActionAndNameRequired,
+
+    #[error("url required for add")]
+    UrlRequiredForAdd,
+
+    #[error("too many arguments")]
+    TooManyArguments,
+
+    #[error("remote name invalid")]
+    RemoteNameInvalid,
+
+    #[error("remote already exists")]
+    RemoteAlreadyExists,
+
+    #[error("remote not found")]
+    RemoteNotFound,
+
+    #[error("unknown action: use 'add' or 'remove'")]
+    UnknownRemoteAction,
+
+    #[error("remote and branch required")]
+    RemoteAndBranchRequired,
+
+    #[error("usage: dolt_fetch(remote [, branch])")]
+    UsageDoltFetch,
+
+    #[error("remote name required")]
+    RemoteNameRequired,
+
+    #[error("branch name required")]
+    BranchNameRequired,
+
+    #[error("fetch failed: branch not found on remote")]
+    FetchBranchNotFound,
+
+    #[error("failed to read remote refs")]
+    FailedReadRemoteRefs,
+
+    #[error("fetch failed")]
+    FetchFailed,
+
+    #[error("usage: dolt_pull(remote, branch)")]
+    UsageDoltPull,
+
+    #[error("tracking branch not found after fetch")]
+    TrackingNotFoundAfterFetch,
+
+    #[error("cannot pull non-current branch without fast-forward")]
+    PullNonCurrentNotFastForward,
+
+    #[error("cannot pull with uncommitted changes")]
+    PullUncommittedChanges,
+
+    #[error("cannot merge a non-fast-forward pull in a lazy store; materialize the store first")]
+    PullLazyNonFF,
+
+    #[error("not a fast-forward of the remote branch (use force to overwrite)")]
+    PushNotFastForward,
+
+    #[error("usage: dolt_clone(['--lazy'], url)")]
+    UsageDoltClone,
+
+    #[error("url required")]
+    UrlRequired,
+
+    #[error("database is not empty — clone into a fresh database")]
+    CloneNotEmpty,
+
+    #[error("gc requires exclusive access")]
+    GcRequiresExclusiveAccess,
+
+    #[error("no credentials; run SELECT dolt_creds_new()")]
+    NoCredentials,
+
+    #[error("no such credential")]
+    NoSuchCredential,
+
+    #[error("usage: dolt_creds('rm', <kid>)")]
+    UsageDoltCreds,
+
+    #[error("failed to open remote (URL must start with file:// or mem://)")]
+    BadRemoteUrl,
+
+    #[error("chunk not found: {0}")]
+    ChunkNotFound(String),
+
+    #[error("chunk verification failed: {0}")]
+    ChunkVerificationFailed(String),
+
+    #[error("VACUUM INTO is not supported for versioned databases")]
+    VacuumIntoUnsupported,
+
+    #[error("invalid snapshot encoding")]
+    InvalidSnapshotEncoding,
+
+    #[error("remote storage failed: {0}")]
+    RemoteStorageFailed(String),
 }
 
 pub type VersionResult<T> = Result<T, VersionError>;
