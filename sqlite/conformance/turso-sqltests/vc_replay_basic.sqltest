@@ -228,3 +228,28 @@ test vc-replay-merge-with-m-parent {
 expect pattern {
     (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n[0-9a-f]{40}\n[0-9a-f]{40}\n3$
 }
+test vc-rebase-plan-edit-full-list {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('c0');
+    SELECT dolt_branch('dev');
+    SELECT dolt_checkout('dev');
+    INSERT INTO t VALUES (2, 'dev-a');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('d1');
+    INSERT INTO t VALUES (3, 'dev-b');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('d2');
+    SELECT dolt_rebase('--onto', 'main', '--plan');
+    SELECT dolt_rebase('--plan', 'pick ' || dolt_hashof('HEAD~1'), 'drop ' || dolt_hashof('HEAD'));
+    SELECT dolt_rebase('--continue');
+    SELECT count(*) FROM dolt_log;
+    SELECT group_concat(message) FROM (SELECT message FROM dolt_log ORDER BY date DESC);
+    SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY id);
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\n1\n[0-9a-f]{40}\n2\n0\n[0-9a-f]{40}\n2\nd1,c0\n1,2$
+}

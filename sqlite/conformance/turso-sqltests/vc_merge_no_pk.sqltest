@@ -1,0 +1,80 @@
+@database :memory:
+
+# vc_merge_no_pk.sqltest
+#
+# Merge semantics for a table without PRIMARY KEY: rows are identified by
+# full-row content. Divergent inserts on both sides read as add/add
+# conflicts; the merge stays open until aborted or resolved.
+
+test vc-no-pk-divergent-inserts-conflict {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE np (a TEXT, b TEXT);
+    INSERT INTO np VALUES ('x', '1'), ('y', '2');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('dev');
+    SELECT dolt_checkout('dev');
+    INSERT INTO np VALUES ('z', '3');
+    DELETE FROM np WHERE a = 'x';
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('dev');
+    SELECT dolt_checkout('main');
+    INSERT INTO np VALUES ('w', '4');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('main');
+    SELECT dolt_merge('dev');
+    SELECT count(*) FROM dolt_conflicts;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0$
+}
+
+test vc-no-pk-merge-abort-restores-rows {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE np (a TEXT, b TEXT);
+    INSERT INTO np VALUES ('x', '1'), ('y', '2');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('dev');
+    SELECT dolt_checkout('dev');
+    INSERT INTO np VALUES ('z', '3');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('dev');
+    SELECT dolt_checkout('main');
+    INSERT INTO np VALUES ('w', '4');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('main');
+    SELECT dolt_merge('dev');
+    SELECT dolt_merge('--abort');
+    SELECT group_concat(a || ':' || b) FROM (SELECT a, b FROM np ORDER BY a);
+    SELECT count(*) FROM dolt_merge_status;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nw:4,x:1,y:2\n0$
+}
+
+test vc-no-pk-identical-inserts-both-sides-merge-clean {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE np (a TEXT, b TEXT);
+    INSERT INTO np VALUES ('x', '1');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('dev');
+    SELECT dolt_checkout('dev');
+    INSERT INTO np VALUES ('same', '2');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('dev');
+    SELECT dolt_checkout('main');
+    INSERT INTO np VALUES ('same', '2');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('main');
+    SELECT dolt_merge('dev');
+    SELECT group_concat(a || ':' || b) FROM (SELECT a, b FROM np ORDER BY a);
+    SELECT count(*) FROM dolt_conflicts;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nsame:2,x:1\n0$
+}

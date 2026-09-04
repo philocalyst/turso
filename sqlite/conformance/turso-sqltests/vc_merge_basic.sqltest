@@ -150,3 +150,85 @@ test vc-merge-second-merge-refused {
 expect error {
     merge already in progress
 }
+test vc-merge-base-returns-common-ancestor {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_merge_base('main', 'feature') = dolt_hashof('main');
+    SELECT dolt_merge_base('main', 'HEAD') = dolt_hashof('main');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\n1\n1$
+}
+
+test vc-merge-base-unknown-branch-errors {
+    SELECT dolt_merge_base('main', 'nope');
+}
+expect error {
+    branch not found: nope
+}
+
+test vc-merge-status-lifecycle-after-resolve-and-commit {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'base');
+    SELECT dolt_add('t');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    UPDATE t SET v = 'theirs' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('feature work');
+    SELECT dolt_checkout('main');
+    UPDATE t SET v = 'ours' WHERE id = 1;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('main work');
+    SELECT dolt_merge('feature');
+    SELECT table_name, rows_conflicted, state FROM dolt_merge_status;
+    SELECT dolt_conflicts_resolve('--theirs', 't', 1);
+    SELECT table_name, rows_merged, state FROM dolt_merge_status;
+    SELECT dolt_add('t');
+    SELECT dolt_commit('merged');
+    SELECT count(*) FROM dolt_merge_status;
+    SELECT v FROM t;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nt\|1\|conflicted\n0\nt\|1\|clean\n1\n[0-9a-f]{40}\n0\ntheirs$
+}
+
+test vc-merge-multi-table-spreads-changes {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE b (id INTEGER PRIMARY KEY, w TEXT);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, x TEXT);
+    INSERT INTO a VALUES (1, 'a1');
+    INSERT INTO b VALUES (1, 'b1');
+    INSERT INTO c VALUES (1, 'c1');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('seed');
+    SELECT dolt_branch('dev');
+    SELECT dolt_checkout('dev');
+    INSERT INTO a VALUES (2, 'a2-dev');
+    UPDATE b SET w = 'b1-dev';
+    ALTER TABLE c ADD COLUMN y TEXT;
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('dev');
+    SELECT dolt_checkout('main');
+    INSERT INTO a VALUES (3, 'a3-main');
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('main');
+    SELECT dolt_merge('dev');
+    SELECT 'A', group_concat(id || ':' || v) FROM (SELECT id, v FROM a ORDER BY id);
+    SELECT 'B', w FROM b;
+    SELECT 'C', count(*) FROM pragma_table_info('c');
+    SELECT table_name FROM dolt_diff_stat('HEAD~1', 'HEAD') ORDER BY table_name;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nA\|1:a1,2:a2-dev,3:a3-main\nB\|b1-dev\nC\|3\na\nb\nc$
+}

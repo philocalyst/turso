@@ -75,3 +75,18 @@ test vc-hashof-determinism {
 expect pattern {
     ^[0-9a-f]{40}\n[0-9a-f]{40}$
 }
+test vc-clean-discards-untracked-table {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed');
+    CREATE TABLE scratch (x INTEGER);
+    INSERT INTO scratch VALUES (1);
+    SELECT dolt_clean();
+    SELECT count(*) FROM sqlite_master WHERE name = 'scratch';
+    SELECT dolt_status();
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0\n0\n$
+}
