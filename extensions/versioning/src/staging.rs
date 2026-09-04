@@ -105,17 +105,17 @@ pub struct VcStore {
     pub(crate) snap_index: HashMap<SnapshotId, (CommitId, String)>,
     /// Configured remotes (name -> url).
     pub(crate) remotes: Vec<RemoteConfig>,
-    /// Remote-tracking refs: (remote, branch) -> last fetched tip.
+    /// Remote-tracking refs: (remote, branch) → last fetched tip.
     pub(crate) tracking: std::collections::BTreeMap<(String, String), CommitId>,
     /// The origin URL of a lazy clone; commits and snapshots fetch on
     /// demand until the store materializes.
     pub(crate) lazy_origin: Option<String>,
-    /// Object closures (ids only) behind each lazy tip, captured at clone
-    /// time so hydration knows what to ask the origin for.
-    pub(crate) lazy_catalog: HashMap<CommitId, Vec<crate::remote_wire::SourceId>>,
     /// Whether the SQL session is inside an explicit BEGIN block (the gc
     /// exclusivity gate reads this).
     in_txn: bool,
+    /// Object closures (ids only) behind each lazy tip, captured at clone
+    /// time so hydration knows what to ask the origin for.
+    pub(crate) lazy_catalog: HashMap<CommitId, Vec<crate::remote_wire::SourceId>>,
     now: i64,
 }
 
@@ -323,6 +323,20 @@ impl VcStore {
     /// The underlying commit store, for graph walks.
     pub fn commit_store(&self) -> &crate::commit::MemCommitStore {
         &self.commits
+    }
+
+    /// The underlying commit store, mutable for gc rebuilds and tests.
+    pub fn commit_store_mut(&mut self) -> &mut crate::commit::MemCommitStore {
+        &mut self.commits
+    }
+
+    /// Replace the commit store's contents wholesale (gc sweep).
+    pub(crate) fn rebuild_commit_store(&mut self, entries: Vec<(CommitId, Commit)>) {
+        let mut fresh = crate::commit::MemCommitStore::new();
+        for (_id, commit) in entries {
+            fresh.put_commit(commit);
+        }
+        self.commits = fresh;
     }
 
     /// How many conflicts are currently recorded.
