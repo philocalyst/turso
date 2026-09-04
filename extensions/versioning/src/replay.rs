@@ -640,6 +640,7 @@ impl VcStore {
         content: &HashMap<String, TableSnapshot>,
     ) -> VersionResult<CommitId> {
         let (name, email) = self.author()?;
+        let first_parent = parents.first().copied();
         let commit = Commit {
             parents,
             root: RootHash([0u8; 20]),
@@ -651,6 +652,9 @@ impl VcStore {
             },
         };
         let id = self.commits.put_commit(commit);
+        // Same rule as plain commits: start from the first parent's full
+        // snapshot, overlay only what this replay changed.
+        self.seed_snapshot_from_parent(id, first_parent);
         for (table, snap) in content {
             self.record_snapshot(
                 id,

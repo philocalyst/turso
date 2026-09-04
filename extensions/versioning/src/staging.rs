@@ -457,6 +457,12 @@ impl VcStore {
             Ok(()) => {}
             Err(RefError::Busy) => return Err(VersionError::DatabaseLocked),
         }
+        // A commit's snapshot is the parent's full content with the staged
+        // tables overlaid. A table absent from a commit's snapshot means
+        // never-created, not unchanged: readers (merge, history, diff) treat
+        // absence as deletion, so inheriting untouched tables keeps a partial
+        // commit from reading as a mass delete.
+        self.seed_snapshot_from_parent(id, parents.first().copied());
         // Record the working content under the new commit so the committed
         // snapshots carry rows for history/at/diff reads. Tables the glue
         // captures separately overwrite these through `record_snapshot`.
@@ -633,6 +639,14 @@ impl VcStore {
                 schema_sql,
             },
         );
+    }
+
+    /// Start a commit's snapshot as a copy of its first parent's snapshot;
+    /// the caller overlays the tables this commit actually changed.
+    pub(crate) fn seed_snapshot_from_parent(&mut self, at: CommitId, parent: Option<CommitId>) {
+        if let Some(inherited) = parent.and_then(|p| self.snapshots.get(&p).cloned()) {
+            self.snapshots.insert(at, inherited);
+        }
     }
 
     /// All table names present in any committed snapshot (conflict detection

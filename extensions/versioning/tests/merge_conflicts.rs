@@ -153,3 +153,51 @@ fn resolve_wrong_side_string_is_rejected_by_func_layer() {
         "invalid resolve side: '--mine' (want '--ours' or '--theirs')"
     );
 }
+
+fn apply_two(s: &mut VcStore, table: &str, rows: &[(i64, &str)]) {
+    s.apply_work(
+        table,
+        vec!["id".to_string(), "v".to_string()],
+        vec!["id".to_string()],
+        rows.iter()
+            .map(|(id, v)| VcRow::new(vec![VcValue::Integer(*id), VcValue::Text(v.to_string())]))
+            .collect(),
+        format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, v TEXT)"),
+    );
+}
+
+#[test]
+fn merge_keeps_theirs_update_in_table_ours_did_not_touch() {
+    let mut s = store();
+    apply_two(&mut s, "a", &[(1, "a1")]);
+    apply_two(&mut s, "b", &[(1, "b1")]);
+    s.track_table("a");
+    s.track_table("b");
+    s.dolt_add(&["a", "b"]).unwrap();
+    s.set_now(1);
+    s.dolt_commit("seed", None, false, false).unwrap();
+    s.create_branch("dev").unwrap();
+    s.checkout("dev").unwrap();
+    apply_two(&mut s, "b", &[(1, "b1-dev")]);
+    s.dolt_add(&["b"]).unwrap();
+    s.set_now(2);
+    s.dolt_commit("dev work", None, false, false).unwrap();
+    s.checkout("main").unwrap();
+    apply_two(&mut s, "a", &[(1, "a1"), (2, "a2-main")]);
+    s.dolt_add(&["a"]).unwrap();
+    s.set_now(3);
+    s.dolt_commit("main work", None, false, false).unwrap();
+    match s.merge_branch("dev", false, false, None).unwrap() {
+        MergeResult::Committed(id) => {
+            let b_rows = s.table_rows("b", &id).unwrap();
+            assert_eq!(
+                b_rows[0].values[1],
+                VcValue::Text("b1-dev".into()),
+                "theirs-only update must survive when ours touched another table"
+            );
+            let a_rows = s.table_rows("a", &id).unwrap();
+            assert_eq!(a_rows.len(), 2);
+        }
+        other => panic!("expected committed merge, got {other:?}"),
+    }
+}
