@@ -57,11 +57,25 @@ Verified zero-coverage APIs across the 9 existing files: `dolt_tag`,
 lifecycle depth (only mid-merge state is asserted, not after-resolve and
 after-commit), `dolt_rebase` plan-table form depth.
 
+Verified vtab gaps blocking differential scenarios (doltlite exposes these;
+turso does not — probed 2026-09-04):
+- `dolt_branches` table: columns `name, hash, latest_commit_message, remote,
+  branch, dirty` (see doltlite `vc_oracle_branches_test.sh:32`)
+- `dolt_tags` table: columns `tag_name, tag_hash, message` (see doltlite
+  `vc_oracle_tags_test.sh:32`)
+
+Known dialect deltas the harness must absorb (scenario prelude whose output
+is discarded; doltlite `dolt_config(k,v)` returns 0 while turso echoes the
+value; both accept `dolt_commit('-m','msg')` flag form — scenarios MUST use
+the flag form, never positional):
+
 Borrow-first resolution (extend existing files; one new file only for no-PK
 merge semantics which fit no existing file):
 
 | Gap | Action |
 |-----|--------|
+| `dolt_branches` vtab | implement in `extensions/versioning` (borrow `vtab_log.rs` module pattern; register beside existing vtabs) + cover |
+| `dolt_tags` vtab | same + cover |
 | `dolt_tag` create/list/delete/checkout-at | extend `vc_branch_basic.sqltest` |
 | `dolt_clean` | extend `vc_commit_gate.sqltest` |
 | `dolt_merge_base` (common ancestor, NULL on unrelated) | extend `vc_merge_basic.sqltest` |
