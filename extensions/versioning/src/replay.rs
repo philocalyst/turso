@@ -1625,9 +1625,7 @@ mod tests {
         if !s.tables().contains(&"dummy".to_string()) {
             s.track_table("dummy");
         }
-        let main_tables: Vec<String> = s.work_tables_content();
-        s.dolt_add(&main_tables.iter().map(|t| t.as_str()).collect::<Vec<_>>())
-            .unwrap();
+        s.dolt_add(&["t", "dummy"]).unwrap();
         s.set_now(10);
         s.dolt_commit("drop t", None, false, false).unwrap();
         // Merge feature into main: base(seed) has "t", main deleted it,

@@ -3002,6 +3002,9 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // Semantic busy refusals are not retryable, but likewise do
+                // not change transaction state and must not cause rollback.
+                Some(LimboError::BusyMessage(_)) => {}
                 // Same-connection "SQL statements in progress" rejections do
                 // not cause a rollback either: the rejected operation was
                 // refused before it touched any transaction or savepoint

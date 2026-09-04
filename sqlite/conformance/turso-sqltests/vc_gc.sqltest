@@ -1,0 +1,37 @@
+@database :memory:
+
+test vc-gc-empty-store {
+    SELECT dolt_gc();
+}
+expect {
+    0 chunks removed, 0 chunks kept
+}
+
+test vc-gc-keeps-live-commit-and-snapshot {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO items VALUES (1, 'one');
+    SELECT dolt_add('items');
+    SELECT dolt_commit('seed');
+    SELECT dolt_gc();
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0 chunks removed, 2 chunks kept$
+}
+
+test vc-gc-refuses-open-transaction {
+    BEGIN;
+    SELECT dolt_gc();
+}
+expect error {
+    gc requires exclusive access
+}
+
+test vc-vacuum-into-refuses-versioned-content {
+    CREATE TABLE items (id INTEGER PRIMARY KEY);
+    VACUUM INTO 'copy.db';
+}
+expect error {
+    VACUUM INTO is not supported for versioned databases
+}

@@ -4349,6 +4349,13 @@ pub fn op_transaction_inner(
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
                 }
+                if is_main_db && statement_writes_db {
+                    if let Some(versioning) = &conn.versioning {
+                        versioning
+                            .guard_write()
+                            .map_err(|error| LimboError::SqlError(error.to_string()))?;
+                    }
+                }
                 let active_writers = conn.n_active_writes.load(Ordering::SeqCst);
                 turso_assert!(
                     active_writers <= 1,
@@ -4965,6 +4972,9 @@ pub fn op_auto_commit(
             }
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
+            if let Some(versioning) = &conn.versioning {
+                versioning.note_txn_event(if *rollback { "ROLLBACK" } else { "COMMIT" });
+            }
         }
         return res;
     }
@@ -5054,6 +5064,9 @@ pub fn op_auto_commit(
                     "rollback-only marker leaked outside an explicit transaction"
                 );
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                if let Some(versioning) = &conn.versioning {
+                    versioning.note_txn_event("BEGIN");
+                }
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
@@ -5124,6 +5137,13 @@ pub fn op_auto_commit(
     }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
+    if let Some(versioning) = &conn.versioning {
+        versioning.note_txn_event(if matches!(tx_op, TxOp::Rollback) {
+            "ROLLBACK"
+        } else {
+            "COMMIT"
+        });
+    }
 
     Ok(res)
 }
@@ -13777,6 +13797,13 @@ pub fn op_drop_table(
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
                 temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
             })?;
+        }
+    }
+    if *db == crate::MAIN_DB_ID {
+        if let Some(versioning) = &conn.versioning {
+            versioning
+                .drop_table(table_name)
+                .map_err(|error| LimboError::SqlError(error.to_string()))?;
         }
     }
     state.pc += 1;

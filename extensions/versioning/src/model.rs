@@ -284,6 +284,9 @@ pub enum VersionError {
     #[error("remote and branch required")]
     RemoteAndBranchRequired,
 
+    #[error("unknown option: {0}")]
+    UnknownOption(String),
+
     #[error("usage: dolt_fetch(remote [, branch])")]
     UsageDoltFetch,
 

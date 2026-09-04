@@ -1793,6 +1793,9 @@ fn vacuum_in_place_step(
                 // we fail fast before doing any expensive work.
                 wal.try_begin_vacuum_checkpoint_lock()?;
                 cleanup_state.checkpoint_cleanup = CheckpointLockCleanup::ReleaseRaw;
+                if let Some(versioning) = &connection.versioning {
+                    versioning.compact_gc();
+                }
                 *phase = VacuumInPlacePhase::BeginSourceTx;
                 continue;
             }

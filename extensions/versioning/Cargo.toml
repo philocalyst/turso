@@ -33,7 +33,16 @@ codspeed-criterion-compat = { workspace = true, features = ["html_reports"] }
 turso_macros.workspace = true
 turso = { path = "../../bindings/rust" }
 futures = "0.3"
+divan = { workspace = true }
 
 [[bench]]
 name = "versioning_bench"
+harness = false
+
+[[bench]]
+name = "versioning_api_bench"
+harness = false
+
+[[bench]]
+name = "versioning_divan"
 harness = false

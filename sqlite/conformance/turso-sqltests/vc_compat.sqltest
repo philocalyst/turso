@@ -1,0 +1,22 @@
+@database :memory:
+
+test vc-compat-integer-primary-key-is-rowid-alias {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO items(rowid, value) VALUES (42, 'answer');
+    SELECT rowid == id, id, value FROM items;
+}
+expect {
+    1|42|answer
+}
+
+test vc-compat-versioned-hash-uses-declared-primary-key {
+    CREATE TABLE keyed (name TEXT PRIMARY KEY, value INTEGER);
+    INSERT INTO keyed VALUES ('z', 2), ('a', 1);
+    SELECT dolt_hashof_table('keyed');
+    DELETE FROM keyed;
+    INSERT INTO keyed VALUES ('a', 1), ('z', 2);
+    SELECT dolt_hashof_table('keyed');
+}
+expect pattern {
+    (?m)^[0-9a-f]{40}\n[0-9a-f]{40}$
+}

@@ -168,6 +168,7 @@ pub trait CommitStore {
 }
 
 /// In-memory commit store for testing.
+#[derive(Clone)]
 pub struct MemCommitStore {
     commits: HashMap<CommitId, Commit>,
 }

@@ -59,6 +59,8 @@ pub fn register_vc_vtabs(api: &ExtensionApi) {
         DoltConstraintViolationsModule::register_DoltConstraintViolationsModule(api);
         DoltBranchesModule::register_DoltBranchesModule(api);
         DoltTagsModule::register_DoltTagsModule(api);
+        DoltRemotesModule::register_DoltRemotesModule(api);
+        DoltRemoteBranchesModule::register_DoltRemoteBranchesModule(api);
     }
 }
 
@@ -255,6 +257,8 @@ enum VcKind {
     Violations,
     Branches,
     Tags,
+    Remotes,
+    RemoteBranches,
     HistoryT,
     AtT,
     BlameT,
@@ -409,6 +413,8 @@ fn build_rows(
         VcKind::Violations => build_violations(state, idx_num, args),
         VcKind::Branches => build_branches(state, conn),
         VcKind::Tags => build_tags(state),
+        VcKind::Remotes => build_remotes(state),
+        VcKind::RemoteBranches => build_remote_branches(state, idx_num, args),
         VcKind::HistoryT => build_history_t(state, table, idx_str, args),
         VcKind::AtT => build_at_t(state, table, idx_str, args),
         VcKind::BlameT => build_blame_t(state, table, idx_str, args),
@@ -769,6 +775,51 @@ fn build_tags(state: Option<Arc<VcState>>) -> Result<Vec<Vec<Cell>>, String> {
     })
 }
 
+fn build_remotes(state: Option<Arc<VcState>>) -> Result<Vec<Vec<Cell>>, String> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    state.with_store(|store| {
+        Ok(turso_versioning::vtab_refs::remotes_rows(store)
+            .into_iter()
+            .map(|row| {
+                vec![
+                    text(row.name),
+                    text(row.url),
+                    text(row.fetch_specs),
+                    text(row.params),
+                ]
+            })
+            .collect())
+    })
+}
+
+fn build_remote_branches(
+    state: Option<Arc<VcState>>,
+    idx_num: i32,
+    args: &[Value],
+) -> Result<Vec<Vec<Cell>>, String> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    let prefix = (idx_num == 1).then(|| arg_text(args, 0)).flatten();
+    state.with_store(|store| {
+        Ok(
+            turso_versioning::vtab_refs::remote_branches_rows(store, prefix.as_deref())
+                .into_iter()
+                .map(|row| {
+                    vec![
+                        text(row.name),
+                        text(row.hash),
+                        text(row.latest_commit_message),
+                        text(prefix.clone().unwrap_or_default()),
+                    ]
+                })
+                .collect(),
+        )
+    })
+}
+
 fn build_conflicts(
     state: Option<Arc<VcState>>,
     idx_num: i32,
@@ -1080,7 +1131,9 @@ fn value_to_cell(v: &VcValue) -> Cell {
     match v {
         VcValue::Null => Cell::Null,
         VcValue::Integer(i) => Cell::Int(*i),
+        VcValue::Real(bits) => Cell::Float(f64::from_bits(*bits)),
         VcValue::Text(s) => Cell::Text(s.clone()),
+        VcValue::Blob(bytes) => Cell::Blob(bytes.clone()),
     }
 }
 
@@ -1088,8 +1141,15 @@ fn value_text(v: &VcValue) -> String {
     match v {
         VcValue::Null => "NULL".to_string(),
         VcValue::Integer(i) => i.to_string(),
+        VcValue::Real(bits) => f64::from_bits(*bits).to_string(),
         VcValue::Text(s) => s.clone(),
+        VcValue::Blob(bytes) => blob_text(bytes),
     }
+}
+
+fn blob_text(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("X'{hex}'")
 }
 
 fn join_values(values: &[VcValue]) -> String {
@@ -1121,7 +1181,9 @@ fn cell_to_value(cell: &Cell) -> Value {
     match cell {
         Cell::Null => Value::null(),
         Cell::Int(i) => Value::from_integer(*i),
+        Cell::Float(value) => Value::from_float(*value),
         Cell::Text(s) => Value::from_text(s.clone()),
+        Cell::Blob(bytes) => Value::from_blob(bytes.clone()),
     }
 }
 
@@ -1131,7 +1193,9 @@ fn cell_to_value(cell: &Cell) -> Value {
 enum Cell {
     Null,
     Int(i64),
+    Float(f64),
     Text(String),
+    Blob(Vec<u8>),
 }
 
 fn err_string(e: impl std::fmt::Display) -> String {
@@ -1661,6 +1725,74 @@ impl VTable for DoltTagsTable {
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
         let plan = plan_equality(&vc_constraints(constraints), 0, 8);
+        Ok(index_info(&plan, constraints.len()))
+    }
+}
+
+#[derive(Debug, VTabModuleDerive, Default)]
+struct DoltRemotesModule;
+
+impl VTabModule for DoltRemotesModule {
+    type Table = DoltRemotesTable;
+    const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+    const NAME: &'static str = "dolt_remotes";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        Ok((
+            turso_versioning::vtab_refs::DOLT_REMOTES_SCHEMA.to_string(),
+            DoltRemotesTable,
+        ))
+    }
+}
+
+struct DoltRemotesTable;
+
+impl VTable for DoltRemotesTable {
+    type Cursor = VcCursor;
+    type Error = String;
+
+    fn open(&self, conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        VcTable {
+            kind: VcKind::Remotes,
+        }
+        .open(conn)
+    }
+}
+
+#[derive(Debug, VTabModuleDerive, Default)]
+struct DoltRemoteBranchesModule;
+
+impl VTabModule for DoltRemoteBranchesModule {
+    type Table = DoltRemoteBranchesTable;
+    const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+    const NAME: &'static str = "dolt_remote_branches";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        Ok((
+            turso_versioning::vtab_refs::DOLT_REMOTE_BRANCHES_SCHEMA.to_string(),
+            DoltRemoteBranchesTable,
+        ))
+    }
+}
+
+struct DoltRemoteBranchesTable;
+
+impl VTable for DoltRemoteBranchesTable {
+    type Cursor = VcCursor;
+    type Error = String;
+
+    fn open(&self, conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        VcTable {
+            kind: VcKind::RemoteBranches,
+        }
+        .open(conn)
+    }
+
+    fn best_index(
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let plan = plan_equality(&vc_constraints(constraints), 3, 8);
         Ok(index_info(&plan, constraints.len()))
     }
 }

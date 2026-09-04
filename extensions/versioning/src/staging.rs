@@ -63,6 +63,7 @@ pub struct TableSnapshot {
 ///
 /// A detached session pins a commit snapshot (R4): every mutating operation
 /// is refused until a checkout reattaches it to a named branch.
+#[derive(Clone)]
 pub struct VcStore {
     pub(crate) commits: MemCommitStore,
     pub(crate) refs: MemRefStore,
@@ -113,8 +114,8 @@ pub struct VcStore {
     /// Whether the SQL session is inside an explicit BEGIN block (the gc
     /// exclusivity gate reads this).
     in_txn: bool,
-    /// Object closures (ids only) behind each lazy tip, captured at clone
-    /// time so hydration knows what to ask the origin for.
+    /// Object closures (ids only) behind each lazy tip, cached on first
+    /// access so later hydration knows what is already local.
     pub(crate) lazy_catalog: HashMap<CommitId, Vec<crate::remote_wire::SourceId>>,
     now: i64,
 }
@@ -190,15 +191,16 @@ impl VcStore {
         rows: Vec<VcRow>,
         schema_sql: String,
     ) {
-        self.work.insert(
-            table.to_string(),
-            TableSnapshot {
-                columns,
-                pk,
-                rows,
-                schema_sql,
-            },
-        );
+        let snapshot = TableSnapshot {
+            columns,
+            pk,
+            rows,
+            schema_sql,
+        };
+        if self.work.get(table) != Some(&snapshot) {
+            self.staging.stage_working(table);
+        }
+        self.work.insert(table.to_string(), snapshot);
     }
 
     /// The working content of one table.
@@ -214,13 +216,16 @@ impl VcStore {
     }
 
     /// Tables whose working content the glue must write back to SQL, drained.
-    pub fn take_work_changes(&mut self) -> Vec<(String, TableSnapshot)> {
+    pub fn take_work_changes(&mut self) -> Vec<(String, Option<TableSnapshot>)> {
         let mut tables: Vec<String> = self.dirty_work.iter().cloned().collect();
         tables.sort();
         self.dirty_work.clear();
         tables
             .into_iter()
-            .filter_map(|t| self.work.get(&t).map(|s| (t, s.clone())))
+            .map(|table| {
+                let snapshot = self.work.get(&table).cloned();
+                (table, snapshot)
+            })
             .collect()
     }
 
@@ -284,6 +289,7 @@ impl VcStore {
         self.tables.insert(name.to_string());
         self.staging.stage_working(name);
         self.pending_drops.remove(name);
+        self.states.remove(name);
     }
 
     /// Remove a table from version control: the next commit records the
@@ -291,11 +297,40 @@ impl VcStore {
     /// side that still has the table sees a real deletion.
     pub fn drop_table(&mut self, name: &str) -> VersionResult<()> {
         self.guard_write()?;
+        let committed = self
+            .head_commit()
+            .and_then(|commit| self.snapshots.get(&commit))
+            .is_some_and(|tables| tables.contains_key(name));
         self.tables.remove(name);
         self.work.remove(name);
-        self.staging.discard(name);
-        self.pending_drops.insert(name.to_string());
+        if committed {
+            self.staging.stage_working(name);
+            self.states.insert(name.to_string(), TableState::Deleted);
+            self.pending_drops.insert(name.to_string());
+        } else {
+            self.staging.discard(name);
+            self.states.remove(name);
+            self.pending_drops.remove(name);
+        }
         Ok(())
+    }
+
+    /// Forget a table that CREATE TABLE registered before the SQL statement
+    /// later failed or rolled back. A committed table disappearing without a
+    /// DROP hook is corruption and must still surface as an error.
+    pub fn discard_missing_uncommitted_table(&mut self, name: &str) -> bool {
+        let committed = self
+            .head_commit()
+            .and_then(|commit| self.snapshots.get(&commit))
+            .is_some_and(|tables| tables.contains_key(name));
+        if committed || self.pending_drops.contains(name) || !self.tables.remove(name) {
+            return false;
+        }
+        self.work.remove(name);
+        self.dirty_work.remove(name);
+        self.staging.discard(name);
+        self.states.remove(name);
+        true
     }
 
     pub fn tables(&self) -> Vec<String> {
@@ -377,11 +412,14 @@ impl VcStore {
     /// Replace the working content with the active branch's committed
     /// snapshots, so a checkout rewrites the SQL tables to that branch's state.
     pub fn sync_work_to_head(&mut self) {
+        let old_names: HashSet<String> = self.work.keys().cloned().collect();
         let head = self.head_commit();
         self.work = head
             .and_then(|id| self.snapshots.get(&id).cloned())
             .unwrap_or_default();
-        let names: Vec<String> = self.work.keys().cloned().collect();
+        let new_names: HashSet<String> = self.work.keys().cloned().collect();
+        let names: Vec<String> = old_names.union(&new_names).cloned().collect();
+        self.tables = new_names;
         self.mark_dirty(&names);
     }
 
@@ -398,7 +436,7 @@ impl VcStore {
     pub fn dolt_add(&mut self, tables: &[&str]) -> VersionResult<()> {
         self.guard_write()?;
         for table in tables {
-            if !self.tables.contains(*table) {
+            if !self.tables.contains(*table) && !self.pending_drops.contains(*table) {
                 return Err(VersionError::TableNotFound(table.to_string()));
             }
             self.staging.stage(table);
@@ -423,8 +461,13 @@ impl VcStore {
         let committed = self.head_commit().and_then(|id| self.snapshots.get(&id));
         let untracked: Vec<String> = self.staging.working_tables();
         let mut names: Vec<String> = self.tables.iter().cloned().collect();
+        names.extend(self.pending_drops.iter().cloned());
         names.sort();
+        names.dedup();
         names.retain(|name| {
+            if self.pending_drops.contains(name) {
+                return true;
+            }
             if untracked.iter().any(|n| n == name) {
                 return true;
             }
@@ -461,6 +504,10 @@ impl VcStore {
         }
         if !self.violations.is_empty() && !force {
             return Err(VersionError::Violations);
+        }
+        if self.lazy_origin.is_some() {
+            self.materialize()?;
+            self.sync_work_to_head();
         }
         if all {
             let changed = self.changed_tables();
@@ -517,7 +564,14 @@ impl VcStore {
         // absence as deletion, so inheriting untouched tables keeps a partial
         // commit from reading as a mass delete.
         self.seed_snapshot_from_parent(id, parents.first().copied());
-        for table in std::mem::take(&mut self.pending_drops) {
+        let committed_drops: Vec<String> = self
+            .last_commit_tables
+            .iter()
+            .filter(|table| self.pending_drops.contains(*table))
+            .cloned()
+            .collect();
+        for table in committed_drops {
+            self.pending_drops.remove(&table);
             if let Some(snapshot) = self.snapshots.get_mut(&id) {
                 snapshot.remove(&table);
             }
@@ -566,6 +620,9 @@ impl VcStore {
     pub fn reset_hard(&mut self) -> VersionResult<()> {
         self.guard_write()?;
         self.staging.clear_all();
+        self.pending_drops.clear();
+        self.states.clear();
+        self.sync_work_to_head();
         Ok(())
     }
 
@@ -573,18 +630,26 @@ impl VcStore {
     /// even when it is modified and sitting in the working set.
     pub fn clean(&mut self) -> VersionResult<Vec<String>> {
         self.guard_write()?;
+        let committed: HashSet<String> = self
+            .head_commit()
+            .and_then(|commit| self.snapshots.get(&commit))
+            .map(|tables| tables.keys().cloned().collect())
+            .unwrap_or_default();
         let before_working = self.staging.working_tables();
         let before_staged = self.staging.staged_tables();
         let mut dropped: Vec<String> = before_working
             .into_iter()
             .chain(before_staged)
-            .filter(|t| !self.tables.contains(t))
+            .filter(|table| !committed.contains(table))
             .collect();
         dropped.sort();
         dropped.dedup();
-        self.staging.discard_untracked(&self.tables);
+        self.staging.discard_untracked(&committed);
         for t in &dropped {
+            self.tables.remove(t);
             self.work.remove(t);
+            self.states.remove(t);
+            self.pending_drops.remove(t);
         }
         Ok(dropped)
     }
@@ -870,6 +935,10 @@ impl VcStore {
         self.lazy_origin.as_deref()
     }
 
+    pub fn has_versioned_content(&self) -> bool {
+        !self.commit_entries().is_empty() || !self.tables.is_empty() || !self.remotes.is_empty()
+    }
+
     /// Look up one commit's snapshot record id for a table.
     pub fn snapshot_id_of(&self, commit: &CommitId, table: &str) -> Option<SnapshotId> {
         self.snap_index
@@ -1108,6 +1177,13 @@ mod tests {
         s.config_set("user.name", "Ada");
         s.config_set("user.email", "ada@example.com");
         s.track_table("t1");
+        s.apply_work(
+            "t1",
+            vec!["id".to_string()],
+            vec!["id".to_string()],
+            Vec::new(),
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY)".to_string(),
+        );
         s.dolt_add(&["t1"]).unwrap();
         s.set_now(1);
         s.dolt_commit("first", None, false, false).unwrap();
@@ -1179,6 +1255,15 @@ mod tests {
     }
 
     #[test]
+    fn missing_uncommitted_table_can_be_discarded() {
+        let mut s = VcStore::new("main");
+        s.track_table("rolled_back");
+        assert!(s.discard_missing_uncommitted_table("rolled_back"));
+        assert!(s.tables().is_empty());
+        assert!(s.status().is_empty());
+    }
+
+    #[test]
     fn add_all_stages_everything() {
         let mut s = VcStore::new("main");
         s.track_table("t1");
@@ -1200,13 +1285,13 @@ mod tests {
 
     #[test]
     fn clean_drops_untracked_working_tables() {
-        let mut s = VcStore::new("main");
-        s.staging.stage_working("ghost");
-        s.track_table("t1");
+        let mut s = configured_store();
+        s.track_table("ghost");
         s.clean().unwrap();
         let rows = s.status();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].table, "t1");
+        assert!(rows.is_empty());
+        assert!(s.tables.contains("t1"));
+        assert!(!s.tables.contains("ghost"));
     }
 
     #[test]

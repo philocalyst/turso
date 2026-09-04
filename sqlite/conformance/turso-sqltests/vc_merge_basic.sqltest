@@ -166,7 +166,7 @@ expect pattern {
 }
 
 test vc-merge-base-unknown-branch-errors {
-    SELECT dolt_merge_base('main', 'nope');
+    SELECT dolt_merge_base('nope', 'main');
 }
 expect error {
     branch not found: nope
@@ -198,7 +198,7 @@ test vc-merge-status-lifecycle-after-resolve-and-commit {
     SELECT v FROM t;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nt\|1\|conflicted\n0\nt\|1\|clean\n1\n[0-9a-f]{40}\n0\ntheirs$
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\nmerge conflict: 1 conflicting rows in 1 tables\nt\|1\|conflicted\n0\nt\|1\|clean\n1\n[0-9a-f]{40}\n0\ntheirs$
 }
 
 test vc-merge-multi-table-spreads-changes {
@@ -230,5 +230,5 @@ test vc-merge-multi-table-spreads-changes {
     SELECT table_name FROM dolt_diff_stat('HEAD~1', 'HEAD') ORDER BY table_name;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nA\|1:a1,2:a2-dev,3:a3-main\nB\|b1-dev\nC\|3\na\nb\nc$
+    (?m)^Ada\nada@example\.com\n3\n[0-9a-f]{40}\ndev\ndev\n3\n[0-9a-f]{40}\nmain\n2\n[0-9a-f]{40}\n[0-9a-f]{40}\nA\|1:a1,2:a2-dev,3:a3-main\nB\|b1-dev\nC\|3\na\nb\nc$
 }

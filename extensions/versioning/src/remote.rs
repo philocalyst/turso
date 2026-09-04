@@ -15,6 +15,7 @@ use crate::remote_wire::{
 use crate::replay::MergeResult;
 use crate::staging::VcStore;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
     pub name: String,
     pub url: String,
@@ -33,7 +34,6 @@ pub fn normalize_remote_name(raw: &str) -> VersionResult<String> {
 /// The object closure of one tip: object ids, their bytes, and per-commit
 /// snapshot lists a remote needs to serve later walks.
 struct Closure {
-    #[allow(dead_code)]
     ids: Vec<SourceId>,
     objects: Vec<(SourceId, Vec<u8>)>,
     snap_lists: Vec<(CommitId, Vec<SnapshotId>)>,
@@ -56,6 +56,7 @@ impl VcStore {
         if self.remotes.iter().any(|r| r.name == name) {
             return Err(VersionError::RemoteAlreadyExists);
         }
+        open_transport(url)?.initialize()?;
         self.remotes.push(RemoteConfig {
             name,
             url: url.to_string(),
@@ -76,25 +77,52 @@ impl VcStore {
     }
 
     pub fn push(&mut self, remote: &str, branch: &str, force: bool) -> VersionResult<()> {
-        let url = self.remote_url(remote)?.to_string();
+        let remote = normalize_remote_name(remote)?;
+        let url = self.remote_url(&remote)?.to_string();
         let transport = open_transport(&url)?;
+        self.push_to_transport(transport.as_ref(), branch, force)
+    }
+
+    pub fn push_to_transport(
+        &self,
+        transport: &dyn RemoteTransport,
+        branch: &str,
+        force: bool,
+    ) -> VersionResult<()> {
         let tip = self
             .refs
             .get(&RefName::branch(branch))
             .ok_or_else(|| VersionError::BranchNotFound(branch.to_string()))?;
         if let Some(remote_tip) = transport.find_branch(branch)? {
             if !force && remote_tip != tip {
-                let provable = self
-                    .get_commit(&remote_tip)
-                    .map(|_| is_ancestor(&self.commits, remote_tip, tip).unwrap_or(false))
-                    .unwrap_or(false);
+                let provable = match self.get_commit(&remote_tip) {
+                    Some(_) => is_ancestor(&self.commits, remote_tip, tip)?,
+                    None => false,
+                };
                 if !provable {
                     return Err(VersionError::PushNotFastForward);
                 }
             }
         }
         let closure = self.local_closure(tip)?;
-        for batch in closure.objects.chunks(SYNC_BATCH_SIZE) {
+        let mut missing = std::collections::HashSet::new();
+        for batch in closure.ids.chunks(SYNC_BATCH_SIZE) {
+            let present = transport.has_many(batch)?;
+            if present.len() != batch.len() {
+                return Err(VersionError::FetchFailed);
+            }
+            for (id, present) in batch.iter().zip(present) {
+                if !present {
+                    missing.insert(*id);
+                }
+            }
+        }
+        let objects: Vec<(SourceId, Vec<u8>)> = closure
+            .objects
+            .into_iter()
+            .filter(|(id, _)| missing.contains(id))
+            .collect();
+        for batch in objects.chunks(SYNC_BATCH_SIZE) {
             transport.put_batch(batch, &closure.snap_lists)?;
         }
         transport.update_branch(branch, tip, force)?;
@@ -102,22 +130,38 @@ impl VcStore {
     }
 
     pub fn fetch(&mut self, remote: &str, branch: &str) -> VersionResult<()> {
-        let url = self.remote_url(remote)?.to_string();
+        let remote = normalize_remote_name(remote)?;
+        let url = self.remote_url(&remote)?.to_string();
         let transport = open_transport(&url)?;
         let Some(tip) = transport.find_branch(branch)? else {
             return Err(VersionError::FetchBranchNotFound);
         };
-        self.fetch_closure(transport.as_ref(), tip)?;
-        self.tracking
-            .insert((remote.to_string(), branch.to_string()), tip);
+        let mut next = self.clone();
+        next.fetch_closure(transport.as_ref(), tip)?;
+        next.tracking.insert((remote, branch.to_string()), tip);
+        *self = next;
         Ok(())
     }
 
+    pub fn remote_default_branch(&self, remote: &str) -> VersionResult<String> {
+        let remote = normalize_remote_name(remote)?;
+        let transport = open_transport(self.remote_url(&remote)?)?;
+        transport.default_branch()
+    }
+
     pub fn pull(&mut self, remote: &str, branch: &str) -> VersionResult<PullOutcome> {
-        self.fetch(remote, branch)?;
+        let mut next = self.clone();
+        let outcome = next.pull_inner(remote, branch)?;
+        *self = next;
+        Ok(outcome)
+    }
+
+    fn pull_inner(&mut self, remote: &str, branch: &str) -> VersionResult<PullOutcome> {
+        let remote = normalize_remote_name(remote)?;
+        self.fetch(&remote, branch)?;
         let tip = *self
             .tracking
-            .get(&(remote.to_string(), branch.to_string()))
+            .get(&(remote.clone(), branch.to_string()))
             .ok_or(VersionError::TrackingNotFoundAfterFetch)?;
         let local_tip = self.refs.get(&RefName::branch(branch));
         if self.has_uncommitted() {
@@ -159,16 +203,18 @@ impl VcStore {
         if !self.clone_fresh() {
             return Err(VersionError::CloneNotEmpty);
         }
+        let mut next = self.clone();
+        next.clone_remote_inner(url, lazy)?;
+        *self = next;
+        Ok(())
+    }
+
+    fn clone_remote_inner(&mut self, url: &str, lazy: bool) -> VersionResult<()> {
         let transport = open_transport(url)?;
         let refs_blob = transport.get_refs()?;
         let refs = crate::remote_wire::decode_refs(&refs_blob)?;
         for (name, tip) in &refs.branches {
-            if lazy {
-                // The catalog is the id closure only: bytes stay remote
-                // until a read needs them.
-                let ids = transport.walk(*tip)?;
-                self.note_lazy_catalog(*tip, ids);
-            } else {
+            if !lazy {
                 self.fetch_closure(transport.as_ref(), *tip)?;
             }
             self.refs.set(&RefName::branch(name), *tip);
@@ -258,6 +304,17 @@ impl VcStore {
         let missing: Vec<SourceId> = ids.into_iter().filter(|id| !self.has_object(id)).collect();
         for batch in missing.chunks(SYNC_BATCH_SIZE) {
             let objects = transport.get_batch(batch)?;
+            if objects.len() != batch.len()
+                || objects
+                    .iter()
+                    .zip(batch)
+                    .any(|((id, _), expected)| id != expected)
+            {
+                return Err(VersionError::FetchFailed);
+            }
+            for (id, bytes) in &objects {
+                crate::remote_wire::verify_object(id, bytes)?;
+            }
             for (id, bytes) in objects {
                 self.store_remote_object(&id, &bytes)?;
             }
@@ -456,32 +513,13 @@ mod tests {
 
     #[test]
     fn remote_push_twice_moves_zero_objects() {
-        let mut store = seeded_store("rt-push2", &[(&1, "a")]);
-        store.remote_add("origin", "mem://rt-push2-1").unwrap();
-        store.push("origin", "main", false).unwrap();
-        let first = counting("rt-push2-1");
-        first
-            .inner
-            .update_branch("main", store.head_commit().unwrap(), true)
-            .unwrap();
-        let store2 = seeded_store("rt-push2b", &[(&1, "a")]);
-        let _ = store2;
-        // Count on the shared endpoint: second push of identical content.
-        let mut again = seeded_store("rt-push2c", &[(&1, "a")]);
-        again.remote_add("origin", "mem://rt-push2-1").unwrap();
-        again.push("origin", "main", false).unwrap();
+        let store = seeded_store("rt-push2", &[(&1, "a")]);
         let counter = counting("rt-push2-1");
-        let before = counter.get_bytes.get();
-        let _ = before;
-        // Third push from the same store: nothing new to move.
-        again.push("origin", "main", false).unwrap();
-        // The counting transport above is a distinct handle; assert through
-        // has_many on the endpoint instead.
-        let remote = crate::remote_transport::MemTransport::open("rt-push2-1", false).unwrap();
-        let tip = again.head_commit().unwrap();
-        let closure = remote.walk(tip).unwrap();
-        let present = remote.has_many(&closure).unwrap();
-        assert!(present.iter().all(|&p| p));
+        store.push_to_transport(&counter, "main", false).unwrap();
+        assert!(counter.put_bytes.get() > 0);
+        counter.put_bytes.set(0);
+        store.push_to_transport(&counter, "main", false).unwrap();
+        assert_eq!(counter.put_bytes.get(), 0);
     }
 
     #[test]

@@ -742,6 +742,7 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            LimboError::BusyMessage(message) => TursoError::Busy(message),
             // Same-connection rejections carry SQLITE_BUSY semantics, but the
             // caller must finish/reset its own statement rather than wait.
             err @ LimboError::StatementsInProgress(_) => TursoError::Busy(err.to_string()),

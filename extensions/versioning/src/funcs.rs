@@ -17,6 +17,8 @@ use crate::vtab_log::VcValue;
 pub enum FuncArg<'a> {
     Text(&'a str),
     Integer(i64),
+    Real(u64),
+    Blob(&'a [u8]),
     Null,
 }
 
@@ -60,10 +62,12 @@ pub trait VcOperations {
     fn config_get(&self, key: &str) -> Option<String>;
     fn config_set(&mut self, key: &str, value: &str);
     fn tables(&self) -> Vec<String>;
+    fn table_hash(&self, table: &str, revision: Option<&str>) -> VersionResult<String>;
+    fn db_hash(&self, revision: Option<&str>) -> VersionResult<String>;
     fn status(&self) -> Vec<StatusRow>;
     fn reset_soft(&mut self) -> VersionResult<()>;
     fn reset_hard(&mut self) -> VersionResult<()>;
-    fn clean(&mut self) -> VersionResult<()>;
+    fn clean(&mut self) -> VersionResult<Vec<String>>;
     fn merge_branch(
         &mut self,
         branch: &str,
@@ -88,6 +92,13 @@ pub trait VcOperations {
     ) -> VersionResult<()>;
     fn verify_constraints(&mut self) -> VersionResult<usize>;
     fn merge_status_rows(&self) -> Vec<MergeStatusRow>;
+    fn remote_add(&mut self, name: &str, url: &str) -> VersionResult<()>;
+    fn remote_remove(&mut self, name: &str) -> VersionResult<()>;
+    fn push(&mut self, remote: &str, branch: &str, force: bool) -> VersionResult<()>;
+    fn fetch(&mut self, remote: &str, branch: Option<&str>) -> VersionResult<()>;
+    fn pull(&mut self, remote: &str, branch: &str) -> VersionResult<()>;
+    fn clone_remote(&mut self, url: &str, lazy: bool) -> VersionResult<()>;
+    fn gc(&mut self) -> VersionResult<String>;
 }
 
 impl VcOperations for crate::staging::VcStore {
@@ -158,6 +169,51 @@ impl VcOperations for crate::staging::VcStore {
         names
     }
 
+    fn table_hash(&self, table: &str, revision: Option<&str>) -> VersionResult<String> {
+        let snapshot = match revision {
+            Some(revision) => {
+                let commit = self.resolve(revision)?;
+                self.snapshots
+                    .get(&commit)
+                    .and_then(|tables| tables.get(table))
+            }
+            None => self.work.get(table).or_else(|| {
+                self.head_commit()
+                    .and_then(|commit| self.snapshots.get(&commit))
+                    .and_then(|tables| tables.get(table))
+            }),
+        }
+        .ok_or_else(|| VersionError::TableNotFound(table.to_string()))?;
+        Ok(crate::remote_wire::snapshot_id(snapshot).to_hex())
+    }
+
+    fn db_hash(&self, revision: Option<&str>) -> VersionResult<String> {
+        let mut snapshots: Vec<(&str, &crate::staging::TableSnapshot)> = match revision {
+            Some(revision) => {
+                let commit = self.resolve(revision)?;
+                self.snapshots
+                    .get(&commit)
+                    .into_iter()
+                    .flat_map(|tables| tables.iter())
+                    .map(|(name, snapshot)| (name.as_str(), snapshot))
+                    .collect()
+            }
+            None => self
+                .work
+                .iter()
+                .map(|(name, snapshot)| (name.as_str(), snapshot))
+                .collect(),
+        };
+        snapshots.sort_by_key(|(name, _)| *name);
+        let mut hasher = Sha256::new();
+        for (name, snapshot) in snapshots {
+            hasher.update(name.as_bytes());
+            hasher.update([0]);
+            hasher.update(crate::remote_wire::encode_snapshot(snapshot));
+        }
+        Ok(hash_bytes(&hasher.finalize()))
+    }
+
     fn status(&self) -> Vec<StatusRow> {
         crate::staging::VcStore::status(self)
     }
@@ -170,9 +226,8 @@ impl VcOperations for crate::staging::VcStore {
         crate::staging::VcStore::reset_hard(self)
     }
 
-    fn clean(&mut self) -> VersionResult<()> {
-        let _ = crate::staging::VcStore::clean(self)?;
-        Ok(())
+    fn clean(&mut self) -> VersionResult<Vec<String>> {
+        crate::staging::VcStore::clean(self)
     }
 
     fn merge_branch(
@@ -238,6 +293,39 @@ impl VcOperations for crate::staging::VcStore {
 
     fn merge_status_rows(&self) -> Vec<MergeStatusRow> {
         crate::staging::VcStore::merge_status_rows(self)
+    }
+
+    fn remote_add(&mut self, name: &str, url: &str) -> VersionResult<()> {
+        crate::staging::VcStore::remote_add(self, name, url)
+    }
+
+    fn remote_remove(&mut self, name: &str) -> VersionResult<()> {
+        crate::staging::VcStore::remote_remove(self, name)
+    }
+
+    fn push(&mut self, remote: &str, branch: &str, force: bool) -> VersionResult<()> {
+        crate::staging::VcStore::push(self, remote, branch, force)
+    }
+
+    fn fetch(&mut self, remote: &str, branch: Option<&str>) -> VersionResult<()> {
+        let branch = match branch {
+            Some(branch) => branch.to_string(),
+            None => crate::staging::VcStore::remote_default_branch(self, remote)?,
+        };
+        crate::staging::VcStore::fetch(self, remote, &branch)
+    }
+
+    fn pull(&mut self, remote: &str, branch: &str) -> VersionResult<()> {
+        crate::staging::VcStore::pull(self, remote, branch).map(|_| ())
+    }
+
+    fn clone_remote(&mut self, url: &str, lazy: bool) -> VersionResult<()> {
+        crate::staging::VcStore::clone_remote(self, url, lazy)
+    }
+
+    fn gc(&mut self) -> VersionResult<String> {
+        crate::gc::gc_exclusive(self)?;
+        Ok(crate::gc::collect_garbage(self).summary())
     }
 }
 
@@ -329,35 +417,29 @@ pub fn dolt_hashof(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult
     Ok(FuncValue::Text(id.to_hex()))
 }
 
-pub fn dolt_hashof_table(_vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
-    // `rev` is accepted but unused: O4 owns real table hashing. The O2 spec
-    // hashes the table name so equal names hash equal independent of history.
-    let name = match args {
-        [name] => text("dolt_hashof_table", name)?,
-        [name, _rev] => text("dolt_hashof_table", name)?,
+pub fn dolt_hashof_table(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    let (name, revision) = match args {
+        [name] => (text("dolt_hashof_table", name)?, None),
+        [name, revision] => (
+            text("dolt_hashof_table", name)?,
+            Some(text("dolt_hashof_table", revision)?),
+        ),
         _ => {
             return Err(VersionError::IncorrectArity(
                 "dolt_hashof_table".to_string(),
             ))
         }
     };
-    Ok(FuncValue::Text(hash_bytes(&Sha256::digest(
-        name.as_bytes(),
-    ))))
+    Ok(FuncValue::Text(vc.table_hash(name, revision)?))
 }
 
 pub fn dolt_hashof_db(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
-    if !matches!(args.len(), 0 | 1) {
-        return Err(VersionError::IncorrectArity("dolt_hashof_db".to_string()));
-    }
-    let mut names = vc.tables();
-    names.sort();
-    let mut hasher = Sha256::new();
-    for name in &names {
-        hasher.update(name.as_bytes());
-        hasher.update([0x00]);
-    }
-    Ok(FuncValue::Text(hash_bytes(&hasher.finalize())))
+    let revision = match args {
+        [] => None,
+        [revision] => Some(text("dolt_hashof_db", revision)?),
+        _ => return Err(VersionError::IncorrectArity("dolt_hashof_db".to_string())),
+    };
+    Ok(FuncValue::Text(vc.db_hash(revision)?))
 }
 
 pub fn dolt_config(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
@@ -409,7 +491,7 @@ pub fn dolt_reset(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<
 
 pub fn dolt_clean(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
     arity_exact("dolt_clean", args, 0)?;
-    vc.clean()?;
+    let _ = vc.clean()?;
     Ok(FuncValue::Integer(0))
 }
 
@@ -578,6 +660,131 @@ pub fn dolt_verify_constraints(
     Ok(FuncValue::Integer(count as i64))
 }
 
+pub fn dolt_remote(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    match args {
+        [] => Err(VersionError::UsageDoltRemote),
+        [_] => Err(VersionError::ActionAndNameRequired),
+        [action, name] => match text("dolt_remote", action)? {
+            "remove" => {
+                vc.remote_remove(text("dolt_remote", name)?)?;
+                Ok(FuncValue::Integer(0))
+            }
+            "add" => Err(VersionError::UrlRequiredForAdd),
+            _ => Err(VersionError::UnknownRemoteAction),
+        },
+        [action, name, url] => match text("dolt_remote", action)? {
+            "add" => {
+                vc.remote_add(text("dolt_remote", name)?, text("dolt_remote", url)?)?;
+                Ok(FuncValue::Integer(0))
+            }
+            "remove" => Err(VersionError::TooManyArguments),
+            _ => Err(VersionError::UnknownRemoteAction),
+        },
+        _ => Err(VersionError::TooManyArguments),
+    }
+}
+
+pub fn dolt_push(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    let (remote, branch, force) = match args {
+        [remote, branch] => (
+            text("dolt_push", remote)?,
+            text("dolt_push", branch)?,
+            false,
+        ),
+        [remote, branch, flag] => {
+            let flag = text("dolt_push", flag)?;
+            if flag != "--force" {
+                return Err(VersionError::UnknownOption(flag.to_string()));
+            }
+            (text("dolt_push", remote)?, text("dolt_push", branch)?, true)
+        }
+        _ => return Err(VersionError::RemoteAndBranchRequired),
+    };
+    if remote.is_empty() || branch.is_empty() {
+        return Err(VersionError::RemoteAndBranchRequired);
+    }
+    vc.push(remote, branch, force)?;
+    Ok(FuncValue::Integer(0))
+}
+
+pub fn dolt_fetch(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    let (remote, branch) = match args {
+        [] => return Err(VersionError::RemoteNameRequired),
+        [remote] => (text("dolt_fetch", remote)?, None),
+        [remote, branch] => (
+            text("dolt_fetch", remote)?,
+            Some(text("dolt_fetch", branch)?),
+        ),
+        _ => return Err(VersionError::UsageDoltFetch),
+    };
+    if remote.is_empty() {
+        return Err(VersionError::RemoteNameRequired);
+    }
+    if branch == Some("") {
+        return Err(VersionError::BranchNameRequired);
+    }
+    vc.fetch(remote, branch)?;
+    Ok(FuncValue::Integer(0))
+}
+
+pub fn dolt_pull(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    let [remote, branch] = args else {
+        return Err(VersionError::UsageDoltPull);
+    };
+    let remote = text("dolt_pull", remote)?;
+    let branch = text("dolt_pull", branch)?;
+    if remote.is_empty() || branch.is_empty() {
+        return Err(VersionError::UsageDoltPull);
+    }
+    vc.pull(remote, branch)?;
+    Ok(FuncValue::Integer(0))
+}
+
+pub fn dolt_clone(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    let (url, lazy) = match args {
+        [] => return Err(VersionError::UrlRequired),
+        [url] => (text("dolt_clone", url)?, false),
+        [flag, url] if text("dolt_clone", flag)? == "--lazy" => (text("dolt_clone", url)?, true),
+        _ => return Err(VersionError::UsageDoltClone),
+    };
+    if url.is_empty() {
+        return Err(VersionError::UrlRequired);
+    }
+    vc.clone_remote(url, lazy)?;
+    Ok(FuncValue::Integer(0))
+}
+
+pub fn dolt_gc(vc: &mut dyn VcOperations, args: &[FuncArg]) -> VersionResult<FuncValue> {
+    arity_exact("dolt_gc", args, 0)?;
+    Ok(FuncValue::Text(vc.gc()?))
+}
+
+pub fn dolt_creds_new(args: &[FuncArg]) -> VersionResult<FuncValue> {
+    arity_exact("dolt_creds_new", args, 0)?;
+    Ok(FuncValue::Text(crate::creds::issue_global().kid))
+}
+
+pub fn dolt_creds(args: &[FuncArg]) -> VersionResult<FuncValue> {
+    use crate::creds::CredStore;
+
+    match args {
+        [] => Ok(FuncValue::Text(
+            crate::creds::with_global(|store| store.list()).join("\n"),
+        )),
+        [action, kid] => {
+            let action = text("dolt_creds", action)?;
+            let kid = text("dolt_creds", kid)?;
+            crate::creds::with_global(|store| match action {
+                "use" => store.set_active(kid),
+                "rm" => store.remove(kid),
+                _ => Err(VersionError::UsageDoltCreds),
+            })?;
+            Ok(FuncValue::Text(kid.to_string()))
+        }
+        _ => Err(VersionError::UsageDoltCreds),
+    }
+}
+
 /// Render a merge/replay driver result as its scalar value: the new commit
 /// hash, the conflict report, or 0 when no commit was made.
 fn merge_result(result: MergeResult) -> FuncValue {
@@ -621,6 +828,8 @@ fn arg_to_value(arg: &FuncArg) -> VcValue {
     match arg {
         FuncArg::Text(s) => VcValue::Text(s.to_string()),
         FuncArg::Integer(i) => VcValue::Integer(*i),
+        FuncArg::Real(bits) => VcValue::Real(*bits),
+        FuncArg::Blob(bytes) => VcValue::Blob(bytes.to_vec()),
         FuncArg::Null => VcValue::Null,
     }
 }
@@ -783,6 +992,85 @@ mod tests {
             dolt_version(&[FuncArg::Text("x")]).unwrap_err().to_string(),
             "incorrect number of arguments to dolt_version"
         );
+    }
+
+    #[test]
+    fn remote_scalars_parse_and_run() {
+        let mut s = store();
+        commit_store(&mut s);
+        assert_eq!(
+            dolt_remote(
+                &mut s,
+                &[
+                    FuncArg::Text("add"),
+                    FuncArg::Text("origin"),
+                    FuncArg::Text("mem://funcs-remote-scalars"),
+                ],
+            )
+            .unwrap(),
+            FuncValue::Integer(0)
+        );
+        assert_eq!(
+            dolt_push(&mut s, &[FuncArg::Text("origin"), FuncArg::Text("main")],).unwrap(),
+            FuncValue::Integer(0)
+        );
+
+        let mut clone = store();
+        assert_eq!(
+            dolt_clone(&mut clone, &[FuncArg::Text("mem://funcs-remote-scalars")],).unwrap(),
+            FuncValue::Integer(0)
+        );
+        assert_eq!(clone.head_commit(), s.head_commit());
+    }
+
+    #[test]
+    fn remote_scalar_errors_are_exact() {
+        let mut s = store();
+        assert_eq!(
+            dolt_remote(&mut s, &[]).unwrap_err(),
+            VersionError::UsageDoltRemote
+        );
+        assert_eq!(
+            dolt_push(&mut s, &[FuncArg::Text("origin")]).unwrap_err(),
+            VersionError::RemoteAndBranchRequired
+        );
+        assert_eq!(
+            dolt_push(
+                &mut s,
+                &[
+                    FuncArg::Text("origin"),
+                    FuncArg::Text("main"),
+                    FuncArg::Text("--nope"),
+                ],
+            )
+            .unwrap_err(),
+            VersionError::UnknownOption("--nope".to_string())
+        );
+        assert_eq!(
+            dolt_fetch(&mut s, &[]).unwrap_err(),
+            VersionError::RemoteNameRequired
+        );
+        assert_eq!(
+            dolt_clone(&mut s, &[]).unwrap_err(),
+            VersionError::UrlRequired
+        );
+    }
+
+    #[test]
+    fn gc_and_credential_scalars_run() {
+        let mut s = store();
+        assert_eq!(
+            dolt_gc(&mut s, &[]).unwrap(),
+            FuncValue::Text("0 chunks removed, 0 chunks kept".to_string())
+        );
+        let FuncValue::Text(kid) = dolt_creds_new(&[]).unwrap() else {
+            panic!("credential id")
+        };
+        assert_eq!(kid.len(), 64);
+        let FuncValue::Text(list) = dolt_creds(&[]).unwrap() else {
+            panic!("credential list")
+        };
+        assert_eq!(list.lines().next(), Some(kid.as_str()));
     }
 
     #[test]
@@ -988,15 +1276,18 @@ mod tests {
     fn hashof_db_history_independent() {
         let mut a = store();
         let mut b = store();
-        a.track_table("t1");
-        a.track_table("t2");
-        b.track_table("t2");
-        b.track_table("t1");
+        for (store, names) in [(&mut a, ["t1", "t2"]), (&mut b, ["t2", "t1"])] {
+            for name in names {
+                store.track_table(name);
+                store.apply_work(name, Vec::new(), Vec::new(), Vec::new(), String::new());
+            }
+        }
         assert_eq!(
             dolt_hashof_db(&mut a, &[]).unwrap(),
             dolt_hashof_db(&mut b, &[]).unwrap()
         );
         a.track_table("t3");
+        a.apply_work("t3", Vec::new(), Vec::new(), Vec::new(), String::new());
         assert_ne!(
             dolt_hashof_db(&mut a, &[]).unwrap(),
             dolt_hashof_db(&mut b, &[]).unwrap()
@@ -1490,6 +1781,14 @@ mod tests {
     fn arg_to_value_preserves_null_pk_cells() {
         assert_eq!(arg_to_value(&FuncArg::Null), VcValue::Null);
         assert_eq!(arg_to_value(&FuncArg::Integer(7)), VcValue::Integer(7));
+        assert_eq!(
+            arg_to_value(&FuncArg::Real(1.5f64.to_bits())),
+            VcValue::real(1.5)
+        );
+        assert_eq!(
+            arg_to_value(&FuncArg::Blob(&[0x00, 0xff])),
+            VcValue::Blob(vec![0x00, 0xff])
+        );
         assert_eq!(
             arg_to_value(&FuncArg::Text("k")),
             VcValue::Text("k".to_string())

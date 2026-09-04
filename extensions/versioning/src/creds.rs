@@ -13,7 +13,7 @@ use crate::model::{VersionError, VersionResult};
 #[derive(Clone)]
 pub struct Credential {
     pub kid: String,
-    pub secret: [u8; 20],
+    pub secret: [u8; 32],
 }
 
 pub trait CredStore {
@@ -54,8 +54,8 @@ impl MemCredStore {
         seed.extend_from_slice(&self.counter.to_le_bytes());
         seed.extend_from_slice(&now_nanos.to_le_bytes());
         seed.extend_from_slice(&self.counter.to_be_bytes());
-        let secret = crate::chunk::blake3_chunk_hash(&seed).0;
-        let kid = hex::encode(&secret[..10]);
+        let secret = *blake3::hash(&seed).as_bytes();
+        let kid = hex::encode(blake3::hash(&secret).as_bytes());
         Credential { kid, secret }
     }
 }
@@ -76,7 +76,16 @@ impl CredStore for MemCredStore {
     }
 
     fn list(&self) -> Vec<String> {
-        self.creds.iter().map(|c| c.kid.clone()).collect()
+        self.active
+            .iter()
+            .cloned()
+            .chain(
+                self.creds
+                    .iter()
+                    .filter(|credential| Some(credential.kid.as_str()) != self.active.as_deref())
+                    .map(|credential| credential.kid.clone()),
+            )
+            .collect()
     }
 
     fn active(&self) -> Option<String> {
@@ -150,7 +159,7 @@ mod tests {
         assert_ne!(a.kid, b.kid);
         // Issuing activates the newest credential.
         assert_eq!(store.active().as_deref(), Some(b.kid.as_str()));
-        assert_eq!(store.list(), vec![a.kid, b.kid]);
+        assert_eq!(store.list(), vec![b.kid, a.kid]);
     }
 
     #[test]

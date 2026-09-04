@@ -226,6 +226,7 @@ pub enum RefError {
 }
 
 /// In-memory reference store with CAS support.
+#[derive(Clone)]
 pub struct MemRefStore {
     refs: HashMap<RefName, CommitId>,
 }

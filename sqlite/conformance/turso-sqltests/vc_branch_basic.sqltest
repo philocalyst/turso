@@ -87,7 +87,7 @@ test vc-tag-lifecycle {
     SELECT tag_name FROM dolt_tags ORDER BY tag_name;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nv1\nv2\nv1\|[0-9a-f]{40}\|\|\nv2\|[0-9a-f]{40}\|\|\nv1\nv2$
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nv1\nv2\nv1\|[0-9a-f]{40}\|\nv2\|[0-9a-f]{40}\|\nv1\nv2$
 }
 
 test vc-tag-delete-unknown-errors {
@@ -101,6 +101,7 @@ test vc-branches-table-lists-branches {
     SELECT dolt_config('user.name', 'Ada');
     SELECT dolt_config('user.email', 'ada@example.com');
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES (1, 'base');
     SELECT dolt_add('t1');
     SELECT dolt_commit('seed1');
     SELECT dolt_branch('feature');
@@ -120,6 +121,6 @@ test vc-branches-table-hash-matches-hashof {
     SELECT dolt_commit('seed1');
     SELECT dolt_hashof('main') = (SELECT hash FROM dolt_branches WHERE name = 'main');
 }
-expect {
-    1
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n1$
 }

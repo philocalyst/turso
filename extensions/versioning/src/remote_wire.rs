@@ -5,10 +5,13 @@
 //! byte-canonical, so both sides agree on ids without trusting each other
 //! (B4: verify before persist).
 
-use crate::commit::{decode_v2, hash_commit, CommitStore};
+#[cfg(test)]
+use crate::commit::hash_commit;
+use crate::commit::{decode_v2, encode_v2, CommitStore};
 use crate::model::{CommitId, VersionError, VersionResult};
 use crate::staging::TableSnapshot;
 use crate::vtab_log::{VcRow, VcValue};
+use sha2::{Digest, Sha256};
 
 /// doltlite `SYNC_BATCH_SIZE`: one has-check or transfer round carries at
 /// most this many ids.
@@ -73,9 +76,23 @@ pub fn encode_snapshot_record(
     let table_bytes = table.as_bytes();
     buf.extend_from_slice(&(table_bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(table_bytes);
-    encode_snapshot_body(&mut buf, snap);
+    buf.extend_from_slice(&encode_snapshot(snap));
     let id = SnapshotId(crate::chunk::blake3_chunk_hash(&buf).0);
     (id, buf)
+}
+
+pub fn encode_snapshot(snap: &TableSnapshot) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    encode_snapshot_body(&mut buf, snap);
+    buf
+}
+
+pub fn decode_snapshot(bytes: &[u8]) -> VersionResult<TableSnapshot> {
+    decode_snapshot_body(Reader::new(bytes))
+}
+
+pub fn snapshot_id(snap: &TableSnapshot) -> SnapshotId {
+    SnapshotId(crate::chunk::blake3_chunk_hash(&encode_snapshot(snap)).0)
 }
 
 pub fn decode_snapshot_record(bytes: &[u8]) -> VersionResult<(CommitId, String, TableSnapshot)> {
@@ -155,15 +172,24 @@ fn encode_snapshot_body(buf: &mut Vec<u8>, snap: &TableSnapshot) {
     buf.extend_from_slice(schema);
 
     let mut rows: Vec<&VcRow> = snap.rows.iter().collect();
+    assert!(
+        snap.rows
+            .iter()
+            .all(|row| row.values.len() == snap.columns.len()),
+        "snapshot row width does not match columns"
+    );
     if !snap.pk.is_empty() {
         let positions: Vec<usize> = snap
             .pk
             .iter()
             .filter_map(|name| snap.columns.iter().position(|c| c == name))
             .collect();
-        if positions.len() == snap.pk.len() {
-            rows.sort_by_cached_key(|r| pk_key(&positions, r));
-        }
+        assert_eq!(
+            positions.len(),
+            snap.pk.len(),
+            "primary key column missing from snapshot"
+        );
+        rows.sort_by_cached_key(|r| pk_key(&positions, r));
     }
 
     buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
@@ -224,6 +250,11 @@ fn decode_snapshot_body(mut reader: Reader) -> VersionResult<TableSnapshot> {
     if reader.pos != reader.bytes.len() {
         return Err(invalid());
     }
+    if pk.iter().any(|name| !columns.contains(name))
+        || rows.iter().any(|row| row.values.len() != columns.len())
+    {
+        return Err(invalid());
+    }
 
     Ok(TableSnapshot {
         columns,
@@ -236,6 +267,8 @@ fn decode_snapshot_body(mut reader: Reader) -> VersionResult<TableSnapshot> {
 const CELL_NULL: u8 = 0;
 const CELL_INT: u8 = 1;
 const CELL_TEXT: u8 = 2;
+const CELL_REAL: u8 = 3;
+const CELL_BLOB: u8 = 4;
 
 fn encode_cell(buf: &mut Vec<u8>, value: &VcValue) {
     match value {
@@ -244,9 +277,18 @@ fn encode_cell(buf: &mut Vec<u8>, value: &VcValue) {
             buf.push(CELL_INT);
             buf.extend_from_slice(&i.to_le_bytes());
         }
+        VcValue::Real(bits) => {
+            buf.push(CELL_REAL);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
         VcValue::Text(s) => {
             buf.push(CELL_TEXT);
             let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        VcValue::Blob(bytes) => {
+            buf.push(CELL_BLOB);
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
@@ -272,6 +314,15 @@ fn decode_cell(reader: &mut Reader) -> VersionResult<VcValue> {
             String::from_utf8(slice.to_vec())
                 .map(VcValue::Text)
                 .map_err(|_| invalid())
+        }
+        CELL_REAL => {
+            let slice = reader.take(8).ok_or_else(invalid)?;
+            Ok(VcValue::Real(u64::from_le_bytes(slice.try_into().unwrap())))
+        }
+        CELL_BLOB => {
+            let len = reader.u32().ok_or_else(invalid)? as usize;
+            let slice = reader.take(len).ok_or_else(invalid)?;
+            Ok(VcValue::Blob(slice.to_vec()))
         }
         _ => Err(invalid()),
     }
@@ -329,9 +380,12 @@ pub fn decode_refs(bytes: &[u8]) -> VersionResult<RemoteRefs> {
 pub fn verify_object(id: &SourceId, bytes: &[u8]) -> VersionResult<()> {
     match id {
         SourceId::Commit(want) => {
+            let digest = Sha256::digest(bytes);
+            if digest[..20] != want.0 {
+                return Err(VersionError::ChunkVerificationFailed(want.to_hex()));
+            }
             let commit = decode_v2(bytes)?;
-            let got = hash_commit(&commit);
-            if &got == want {
+            if encode_v2(&commit) == bytes {
                 Ok(())
             } else {
                 Err(VersionError::ChunkVerificationFailed(want.to_hex()))
@@ -421,6 +475,21 @@ mod tests {
     }
 
     #[test]
+    fn wire_snapshot_roundtrip_preserves_real_and_blob() {
+        let snapshot = snap(
+            &["id", "real_value", "blob_value"],
+            &["id"],
+            vec![vec![
+                VcValue::Integer(1),
+                VcValue::real(-0.0),
+                VcValue::Blob(vec![0x00, 0x7f, 0xff]),
+            ]],
+        );
+        let bytes = encode_snapshot(&snapshot);
+        assert_eq!(decode_snapshot(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
     fn wire_snapshot_rows_sorted_by_pk() {
         let owner = CommitId([0x33; 20]);
         let mut a = snap(&["id", "v"], &["id"], vec![row(2, "b"), row(1, "a")]);
@@ -451,7 +520,7 @@ mod tests {
     #[test]
     fn wire_snapshot_record_rejects_truncation() {
         let owner = CommitId([0x55; 20]);
-        let s = snap(&["id"], &["id"], vec![row(1, "a")]);
+        let s = snap(&["id"], &["id"], vec![vec![VcValue::Integer(1)]]);
         let (_, bytes) = encode_snapshot_record(&owner, "t", &s);
         for cut in [0usize, 4, 10, bytes.len() - 1] {
             assert!(decode_snapshot_record(&bytes[..cut]).is_err());
@@ -521,7 +590,7 @@ mod tests {
         );
 
         let owner = CommitId([0x66; 20]);
-        let s = snap(&["id"], &["id"], vec![row(1, "a")]);
+        let s = snap(&["id"], &["id"], vec![vec![VcValue::Integer(1)]]);
         let (sid, sbytes) = encode_snapshot_record(&owner, "t", &s);
         verify_object(&SourceId::Snapshot(sid), &sbytes).unwrap();
         let mut bad = sbytes.clone();
@@ -558,7 +627,7 @@ mod tests {
         .unwrap();
 
         let owner = CommitId([0x77; 20]);
-        let s = snap(&["id"], &["id"], vec![row(1, "a")]);
+        let s = snap(&["id"], &["id"], vec![vec![VcValue::Integer(1)]]);
         let (sid, sbytes) = encode_snapshot_record(&owner, "t", &s);
         store_object(
             &mut commits,

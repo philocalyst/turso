@@ -7,8 +7,37 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 
 use turso_versioning::chunk::{blake3_chunk_hash, ProllyNode, WeibullChunker, MAX_ITEMS};
 use turso_versioning::model::NodeFlags;
+use turso_versioning::orm::{OrmError, VersionIndex, VersionedDb, VersionedRow};
 use turso_versioning::staging::VcStore;
 use turso_versioning::vtab_log::{VcRead, VcRow, VcValue};
+
+struct IndexedUser {
+    id: i64,
+    name: String,
+}
+
+impl VersionedRow for IndexedUser {
+    const TABLE: &'static str = "indexed_users";
+    const COLUMNS: &'static [&'static str] = &["id", "name"];
+    const PK: &'static [&'static str] = &["id"];
+
+    fn into_row(&self) -> VcRow {
+        VcRow::new(vec![
+            VcValue::Integer(self.id),
+            VcValue::Text(self.name.clone()),
+        ])
+    }
+
+    fn from_row(row: &VcRow) -> Result<Self, OrmError> {
+        match row.values.as_slice() {
+            [VcValue::Integer(id), VcValue::Text(name)] => Ok(Self {
+                id: *id,
+                name: name.clone(),
+            }),
+            _ => Err(OrmError::Decode("invalid indexed user".into())),
+        }
+    }
+}
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_weibull_64mib(c: &mut Criterion) {
@@ -66,7 +95,12 @@ fn seeded_store(rows: usize) -> VcStore {
         vec!["id".to_string(), "v".to_string()],
         vec!["id".to_string()],
         (0..rows)
-            .map(|i| VcRow::new(vec![VcValue::Integer(i as i64), VcValue::Text(format!("v{i}"))]))
+            .map(|i| {
+                VcRow::new(vec![
+                    VcValue::Integer(i as i64),
+                    VcValue::Text(format!("v{i}")),
+                ])
+            })
             .collect(),
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
     );
@@ -94,7 +128,10 @@ fn bench_vc_commit_latency(c: &mut Criterion) {
                 "t",
                 vec!["id".to_string(), "v".to_string()],
                 vec!["id".to_string()],
-                vec![VcRow::new(vec![VcValue::Integer(1), VcValue::Text("x".into())])],
+                vec![VcRow::new(vec![
+                    VcValue::Integer(1),
+                    VcValue::Text("x".into()),
+                ])],
                 "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)".to_string(),
             );
             s.dolt_add(&["t"]).unwrap();
@@ -109,7 +146,8 @@ fn bench_vc_branch_create(c: &mut Criterion) {
     c.bench_function("vc_branch_create", |b| {
         b.iter(|| {
             let mut s = seeded_store(10);
-            black_box(s.create_branch(black_box("feature")).unwrap());
+            s.create_branch("feature").unwrap();
+            black_box(s.list_branches().len());
         });
     });
 }
@@ -124,10 +162,10 @@ fn bench_vc_diff_stat(c: &mut Criterion) {
                 "t",
                 vec!["id".to_string(), "v".to_string()],
                 vec!["id".to_string()],
-                (0..1000)
+                (0..1000i64)
                     .map(|i| {
                         VcRow::new(vec![
-                            VcValue::Integer(i as i64),
+                            VcValue::Integer(i),
                             VcValue::Text(format!("v{}", i + 1)),
                         ])
                     })
@@ -159,7 +197,7 @@ fn bench_vc_log_scan(c: &mut Criterion) {
             let mut s = VcStore::new("main");
             s.config_set("user.name", "Ada");
             s.config_set("user.email", "ada@example.com");
-            for i in 0..100 {
+            for i in 0..100i64 {
                 s.apply_work(
                     "t",
                     vec!["id".to_string()],
@@ -169,7 +207,7 @@ fn bench_vc_log_scan(c: &mut Criterion) {
                 );
                 s.track_table("t");
                 s.dolt_add(&["t"]).unwrap();
-                s.set_now(i as i64);
+                s.set_now(i);
                 let tip = s.dolt_commit(&format!("c{i}"), None, false, false).unwrap();
                 s.record_snapshot(
                     tip,
@@ -185,6 +223,51 @@ fn bench_vc_log_scan(c: &mut Criterion) {
     });
 }
 
+fn indexed_history(depth: usize) -> (VersionIndex<IndexedUser, String>, Vec<String>) {
+    let mut db = VersionedDb::new("main").unwrap();
+    db.store_mut().config_set("user.name", "Ada");
+    db.store_mut().config_set("user.email", "ada@example.com");
+    for version in 0..depth {
+        db.table::<IndexedUser>()
+            .version(
+                &IndexedUser {
+                    id: 1,
+                    name: format!("value-{version}"),
+                },
+                &format!("version {version}"),
+            )
+            .unwrap();
+    }
+    let index = db
+        .table::<IndexedUser>()
+        .version_index_by(|user| user.name.clone())
+        .unwrap();
+    let linear = index
+        .iter()
+        .flat_map(|(value, pointers)| std::iter::repeat_n(value.clone(), pointers.len()))
+        .collect();
+    (index, linear)
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_orm_history_value_lookup(c: &mut Criterion) {
+    let (index, linear) = indexed_history(500);
+    let needle = "value-250";
+    let mut group = c.benchmark_group("orm_history_value_lookup_500");
+    group.bench_function("version_index", |b| {
+        b.iter(|| black_box(index.get(black_box(needle))).len());
+    });
+    group.bench_function("linear_scan", |b| {
+        b.iter(|| {
+            black_box(&linear)
+                .iter()
+                .filter(|value| value.as_str() == black_box(needle))
+                .count()
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_weibull_64mib,
@@ -193,6 +276,7 @@ criterion_group!(
     bench_vc_commit_latency,
     bench_vc_branch_create,
     bench_vc_diff_stat,
-    bench_vc_log_scan
+    bench_vc_log_scan,
+    bench_orm_history_value_lookup
 );
 criterion_main!(benches);

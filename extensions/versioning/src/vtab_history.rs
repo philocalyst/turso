@@ -312,7 +312,9 @@ fn cell_text(value: Option<&VcValue>) -> String {
     match value {
         Some(VcValue::Text(s)) => format!("t:{s}"),
         Some(VcValue::Integer(i)) => format!("i:{i}"),
-        _ => "n:".to_string(),
+        Some(VcValue::Real(bits)) => format!("r:{bits:016x}"),
+        Some(VcValue::Blob(bytes)) => format!("b:{}", hex::encode(bytes)),
+        Some(VcValue::Null) | None => "n:".to_string(),
     }
 }
 

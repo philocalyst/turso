@@ -741,7 +741,8 @@ impl Value {
                     return Ok(Value::Null);
                 };
                 match err {
-                    (ResultCode::Busy, _) => Err(LimboError::Busy),
+                    (ResultCode::Busy, Some(msg)) => Err(LimboError::BusyMessage(msg)),
+                    (ResultCode::Busy, None) => Err(LimboError::Busy),
                     (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
                     (code, None) => Err(LimboError::ExtensionError(code.to_string())),
                 }
@@ -4874,9 +4875,17 @@ mod tests {
 
     #[test]
     fn ext_busy_error_surfaces_as_limbo_busy() {
-        let ext =
-            ExtValue::error_with_code_message(ResultCode::Busy, "database is locked".to_string());
+        let ext = ExtValue::error(ResultCode::Busy);
         assert!(matches!(Value::from_ffi(ext), Err(LimboError::Busy)));
+
+        let ext = ExtValue::error_with_code_message(
+            ResultCode::Busy,
+            "gc requires exclusive access".to_string(),
+        );
+        assert!(matches!(
+            Value::from_ffi(ext),
+            Err(LimboError::BusyMessage(msg)) if msg == "gc requires exclusive access"
+        ));
     }
 
     #[test]

@@ -441,9 +441,40 @@ New (ours, documented divergences):
 
 ## Status
 
-- [ ] rubric written (this file)
-- [ ] v1 implemented (nemotron)
-- [ ] reviewer pass 1 (muse-spark) — findings logged below
-- [ ] fix loop to GREEN
-- [ ] validation output pasted
-- [ ] `.claude/skills/remotes-protocol/SKILL.md` written (orchestrator)
+- [x] rubric written (this file)
+- [x] v1 implemented
+- [x] reviewer pass completed — findings logged below
+- [x] fix loop to GREEN
+- [x] validation output recorded
+- [x] `.claude/skills/remotes-protocol/SKILL.md` written
+
+## Status / Fix Log — 2026-09-04
+
+- Remote commands now verify downloaded objects before persistence, transfer
+  objects before refs, and restore local refs, tracking refs, lazy state, and
+  working state after failures.
+- The file transport uses unique temporary files, fsyncs objects before the
+  ref swap, and rejects corrupt refs and objects. The memory transport follows
+  the same typed server protocol and authorization rules.
+- Lazy clones fetch verified objects in atomic batches, cache successful
+  reads, materialize before writes, and write materialized state back to SQL.
+- GC walks the full ref/commit/snapshot closure, honors its exclusive-access
+  gate, and is wired to in-place `VACUUM`. `VACUUM INTO` keeps SQLite's
+  in-transaction error precedence and otherwise refuses versioned databases.
+- Direct SQL inserts, updates, deletes, table drops, failed/rolled-back table
+  creation, and hard resets now keep the versioned working set exact. REAL and
+  BLOB values preserve their types through capture, history, diff, and replay.
+- A partial commit now removes only table drops explicitly included in its
+  staged set. This closes the cross-table deletion leak found during the ORM
+  row-commit review.
+- ORM history lookups can build a reusable typed B-tree index by any row value.
+  Hits carry persistable `(commit, primary key, verified row ordinal)` pointers
+  that normally load the exact historical row in constant time.
+- `nix develop -c cargo test -p turso_versioning`: 452 passed, 0 failed across
+  all unit and integration test targets (380 library tests plus 72 integration
+  tests).
+- `nix develop -c cargo clippy -p turso_versioning -p turso_ext -p turso_core
+  --all-features --all-targets -- --deny=warnings`: passed.
+- `nix develop -c cargo fmt --all -- --check` and `git diff --check`: passed.
+- Full pinned conformance run: SQLite 12,787 passed / 0 failed / 0 errors / 7
+  skipped; Turso 1,675 passed / 0 failed / 0 errors / 341 skipped.

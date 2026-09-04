@@ -108,11 +108,10 @@ pub fn collect_garbage(store: &mut VcStore) -> GcStats {
         .filter(|id| !live.contains(id))
         .copied()
         .collect();
-    removed += dead_snapshots.len();
     for id in &dead_snapshots {
-        store.snapshots.remove(id);
+        removed += store.snapshots.remove(id).map_or(0, |tables| tables.len());
     }
-    kept += store.snapshots.len();
+    kept += store.snapshots.values().map(HashMap::len).sum::<usize>();
 
     // The id index follows the records it describes.
     store

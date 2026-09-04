@@ -257,12 +257,30 @@ cargo bench -p turso_versioning --bench versioning_divan -- --test       # compi
 
 ## 8. Deliverables Checklist
 
-- [ ] `testing/doltlite-oracle` crate: runner, normalization, structured diff, `--filter/--batch/--time`
-- [ ] Buckets populated: refs-workspace, diff-history-data, merge-replay-schema, feature-interaction (≥2 scenarios each); remotes-recovery untouched by O6
-- [ ] `check_buckets` guard green in `cargo test`
-- [ ] Differential run green with `$DOLTLITE_BIN` set (zero divergences)
-- [ ] Corpus gaps closed (§2), runner green
-- [ ] 11 Criterion API benches + 6 Divan benches compile and run
-- [ ] `PERF_O6.md` with honest per-operation comparison
-- [ ] `.claude/skills/vc-perf-benchmarks/SKILL.md`
-- [ ] All gates green; no O5-owned path modified; zero waived blockers
+- [x] `testing/doltlite-oracle` crate: runner, normalization, structured diff, `--filter/--batch/--time`, and deterministic `--seeds START:END`
+- [x] Buckets populated: refs-workspace, diff-history-data, merge-replay-schema, feature-interaction (≥2 scenarios each); remotes-recovery untouched by O6
+- [x] `check_buckets` guard green in `cargo test`
+- [x] Differential run green with `$DOLTLITE_BIN` set (18 scenarios and the 1:10000 seed sweep)
+- [x] Corpus gaps closed (§2), runner green
+- [x] 12 Criterion API benches + 6 Divan benches compile and run
+- [x] `PERF_O6.md` with honest per-operation comparison
+- [x] `.claude/skills/vc-perf-benchmarks/SKILL.md`
+- [x] All gates green; no O5-owned path modified; zero waived blockers
+
+## 9. Status / fix log — 2026-09-04
+
+- `nix develop -c cargo test -p turso_versioning`: 357 passed.
+- `nix develop -c cargo test -p doltlite_oracle`: 10 passed, 1 ignored (the
+  ignored test requires `$DOLTLITE_BIN` and is covered by the explicit batch
+  run).
+- Pinned differential run: 18/18 checked-in scenarios passed against
+  DoltLite commit `5c67114`; `run --seeds 1:10000` passed 10,000/10,000.
+- Criterion API target: all 12 `-- --test` benchmark checks succeeded.
+- Divan target: all 6 benches and declared argument sweeps compiled and were
+  discovered by `-- --test`.
+- Final integrated gates passed: `cargo fmt --all -- --check`, strict combined
+  clippy for `turso_versioning`/`turso_ext`/`turso_core`, and the full pinned
+  conformance run (SQLite 12,787 passed; Turso 1,675 passed; zero failures or
+  errors). The final `turso_versioning` package run passed 452 tests. The
+  versioning Criterion target also covers indexed versus linear ORM history
+  lookup across 500 historical values.

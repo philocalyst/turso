@@ -27,6 +27,18 @@ pub fn translate_vacuum(
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
     match into {
         Some(dest_expr) => {
+            // The runtime owns SQLite's transaction error. Preserve that
+            // precedence before applying the versioning-specific refusal.
+            if connection.get_auto_commit()
+                && connection
+                    .versioning
+                    .as_ref()
+                    .is_some_and(|state| state.has_versioned_content())
+            {
+                return Err(LimboError::ParseError(
+                    "VACUUM INTO is not supported for versioned databases".to_string(),
+                ));
+            }
             // VACUUM INTO 'path' - create compacted copy at destination
             let dest_path = extract_path_from_expr(dest_expr)?;
             program.emit_insn(Insn::VacuumInto {

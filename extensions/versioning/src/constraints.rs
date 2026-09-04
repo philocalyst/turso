@@ -277,9 +277,14 @@ fn check_strict(out: &mut Vec<Violation>, table: &MergedTable) {
             let Some(value) = row.values.get(i) else {
                 continue;
             };
-            let bad = matches!(
+            let bad = !matches!(
                 (want, value),
-                (StrictType::Integer, VcValue::Text(_)) | (StrictType::Text, VcValue::Integer(_))
+                (StrictType::Any, _)
+                    | (_, VcValue::Null)
+                    | (StrictType::Integer, VcValue::Integer(_))
+                    | (StrictType::Real, VcValue::Real(_))
+                    | (StrictType::Text, VcValue::Text(_))
+                    | (StrictType::Blob, VcValue::Blob(_))
             );
             if bad {
                 out.push(Violation {
@@ -877,7 +882,9 @@ fn tokenize(sql: &str) -> Vec<String> {
 enum StrictType {
     Any,
     Integer,
+    Real,
     Text,
+    Blob,
 }
 
 fn strict_type(decl: &str) -> StrictType {
@@ -886,7 +893,9 @@ fn strict_type(decl: &str) -> StrictType {
         "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" | "MEDIUMINT" | "INT2" | "INT8" => {
             StrictType::Integer
         }
+        "REAL" | "FLOAT" | "DOUBLE" => StrictType::Real,
         "TEXT" | "VARCHAR" | "CHAR" | "CLOB" => StrictType::Text,
+        "BLOB" => StrictType::Blob,
         _ => StrictType::Any,
     }
 }
@@ -894,7 +903,9 @@ fn strict_type(decl: &str) -> StrictType {
 fn strict_type_name(ty: &StrictType) -> &'static str {
     match ty {
         StrictType::Integer => "INTEGER",
+        StrictType::Real => "REAL",
         StrictType::Text => "TEXT",
+        StrictType::Blob => "BLOB",
         StrictType::Any => "ANY",
     }
 }
@@ -903,7 +914,9 @@ fn value_type_name(value: &VcValue) -> &'static str {
     match value {
         VcValue::Null => "NULL",
         VcValue::Integer(_) => "INTEGER",
+        VcValue::Real(_) => "REAL",
         VcValue::Text(_) => "TEXT",
+        VcValue::Blob(_) => "BLOB",
     }
 }
 

@@ -31,13 +31,28 @@ pub fn staged_id() -> CommitId {
 pub enum VcValue {
     Null,
     Integer(i64),
+    /// IEEE-754 bits preserve the exact SQL REAL value while keeping rows
+    /// hashable and totally ordered for deterministic snapshots.
+    Real(u64),
     Text(String),
+    Blob(Vec<u8>),
 }
 
 impl VcValue {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             VcValue::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn real(value: f64) -> Self {
+        VcValue::Real(value.to_bits())
+    }
+
+    pub fn as_real(&self) -> Option<f64> {
+        match self {
+            VcValue::Real(bits) => Some(f64::from_bits(*bits)),
             _ => None,
         }
     }

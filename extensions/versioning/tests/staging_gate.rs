@@ -4,12 +4,20 @@
 use turso_versioning::model::{CommitId, VersionError};
 use turso_versioning::session::SessionBranch;
 use turso_versioning::staging::{TableState, VcStore};
+use turso_versioning::vtab_log::VcRow;
 
 fn configured_store() -> VcStore {
     let mut s = VcStore::new("main");
     s.config_set("user.name", "Ada");
     s.config_set("user.email", "ada@example.com");
     s.track_table("t1");
+    s.apply_work(
+        "t1",
+        vec!["id".to_string()],
+        vec!["id".to_string()],
+        Vec::<VcRow>::new(),
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY)".to_string(),
+    );
     s.dolt_add(&["t1"]).unwrap();
     s.set_now(1);
     s.dolt_commit("first", None, false, false).unwrap();

@@ -90,3 +90,84 @@ test vc-clean-discards-untracked-table {
 expect pattern {
     (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0\n0\n$
 }
+
+test vc-status-detects-direct-update {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES (1, 'before');
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed');
+    UPDATE t1 SET v = 'after' WHERE id = 1;
+    SELECT dolt_status();
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nt1\|0\|modified$
+}
+
+test vc-reset-hard-restores-content-and-drops-new-tables {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES (1, 'before');
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed');
+    UPDATE t1 SET v = 'after' WHERE id = 1;
+    CREATE TABLE scratch (id INTEGER);
+    INSERT INTO scratch VALUES (1);
+    SELECT dolt_reset('--hard');
+    SELECT v FROM t1;
+    SELECT count(*) FROM sqlite_master WHERE name = 'scratch';
+    SELECT dolt_status();
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0\nbefore\n0\n$
+}
+
+test vc-drop-table-can-be-staged-and-committed {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t1 VALUES (1, 'before');
+    SELECT dolt_add('t1');
+    SELECT dolt_commit('seed');
+    DROP TABLE t1;
+    SELECT dolt_status();
+    SELECT dolt_add('-A');
+    SELECT dolt_commit('drop t1');
+    SELECT count(*) FROM sqlite_master WHERE name = 't1';
+    SELECT dolt_status();
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nt1\|0\|deleted\n1\n[0-9a-f]{40}\n0\n$
+}
+
+test vc-real-and-blob-survive-branch-writeback {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE typed_values (id INTEGER PRIMARY KEY, r REAL, b BLOB);
+    INSERT INTO typed_values VALUES (1, 1.25, x'007fff');
+    SELECT dolt_add('typed_values');
+    SELECT dolt_commit('seed typed values');
+    SELECT dolt_branch('feature');
+    SELECT dolt_checkout('feature');
+    UPDATE typed_values SET r = 2.5, b = x'aabb' WHERE id = 1;
+    SELECT dolt_add('typed_values');
+    SELECT dolt_commit('change typed values');
+    SELECT dolt_checkout('main');
+    SELECT typeof(r), r, hex(b) FROM typed_values;
+    SELECT dolt_checkout('feature');
+    SELECT typeof(r), r, hex(b) FROM typed_values;
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\nfeature\nfeature\n1\n[0-9a-f]{40}\nmain\nreal\|1\.25\|007FFF\nfeature\nreal\|2\.5\|AABB$
+}
+
+test vc-rolled-back-create-does-not-poison-status {
+    BEGIN;
+    CREATE TABLE rolled_back (id INTEGER PRIMARY KEY);
+    ROLLBACK;
+    SELECT dolt_status();
+}
+expect {
+}

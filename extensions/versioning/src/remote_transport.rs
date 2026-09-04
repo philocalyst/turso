@@ -6,15 +6,22 @@
 //! HTTP client registers behind `RemoteTransport` later.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::commit::decode_v2;
 use crate::model::{CommitId, VersionError, VersionResult};
-use crate::remote_wire::{decode_refs, encode_refs, RemoteRefs, SnapshotId, SourceId};
+use crate::remote_wire::{
+    decode_refs, encode_refs, RemoteRefs, SnapshotId, SourceId, SYNC_BATCH_SIZE,
+};
 
 /// Everything a remote command can ask of storage.
 pub trait RemoteTransport {
+    fn initialize(&self) -> VersionResult<()> {
+        Ok(())
+    }
     /// The raw refs blob bytes (see `remote_wire::decode_refs`).
     fn get_refs(&self) -> VersionResult<Vec<u8>>;
     /// The remote's default branch name.
@@ -110,7 +117,8 @@ pub fn open_transport(url: &str) -> VersionResult<Box<dyn RemoteTransport>> {
         return Err(VersionError::BadRemoteUrl);
     };
     match scheme {
-        "file" => Ok(Box::new(FileTransport::open(PathBuf::from(rest)))),
+        "file" if !rest.is_empty() => Ok(Box::new(FileTransport::open(PathBuf::from(rest)))),
+        "file" => Err(VersionError::BadRemoteUrl),
         "mem" => {
             let (name, query) = match rest.split_once('?') {
                 Some((name, query)) => (name, Some(query)),
@@ -285,11 +293,18 @@ pub fn serve(
     }
     match req {
         Request::GetRefs => Ok(Response::Refs(encode_refs(&endpoint.refs))),
+        Request::HasMany(ids) if ids.len() > SYNC_BATCH_SIZE => Err(VersionError::FetchFailed),
         Request::HasMany(ids) => Ok(Response::Presence(
             ids.iter()
-                .map(|id| endpoint.objects.contains_key(id))
+                .map(|id| {
+                    endpoint
+                        .objects
+                        .get(id)
+                        .is_some_and(|bytes| crate::remote_wire::verify_object(id, bytes).is_ok())
+                })
                 .collect(),
         )),
+        Request::GetBatch(ids) if ids.len() > SYNC_BATCH_SIZE => Err(VersionError::FetchFailed),
         Request::GetBatch(ids) => {
             let mut objects = Vec::with_capacity(ids.len());
             for id in ids {
@@ -301,7 +316,25 @@ pub fn serve(
             }
             Ok(Response::Objects(objects))
         }
+        Request::PutBatch(objects, _) if objects.len() > SYNC_BATCH_SIZE => {
+            Err(VersionError::FetchFailed)
+        }
         Request::PutBatch(objects, snap_lists) => {
+            for (id, bytes) in &objects {
+                crate::remote_wire::verify_object(id, bytes)?;
+            }
+            for (commit, snaps) in &snap_lists {
+                if endpoint
+                    .snap_lists
+                    .get(commit)
+                    .is_some_and(|existing| existing != snaps)
+                {
+                    return Err(VersionError::RemoteStorageFailed(format!(
+                        "snapshot list changed for {}",
+                        commit.to_hex()
+                    )));
+                }
+            }
             for (id, bytes) in objects {
                 endpoint.objects.insert(id, bytes);
             }
@@ -315,6 +348,7 @@ pub fn serve(
             commit,
             force,
         } => {
+            walk_objects(&endpoint.objects, &endpoint.snap_lists, commit)?;
             match endpoint
                 .refs
                 .branches
@@ -322,16 +356,24 @@ pub fn serve(
                 .find(|(name, _)| *name == branch)
             {
                 Some((_name, tip)) => {
-                    if !force && *tip != commit && !is_ancestor(&endpoint.objects, *tip, commit) {
+                    if !force && *tip != commit && !is_ancestor(&endpoint.objects, *tip, commit)? {
                         return Err(VersionError::PushNotFastForward);
                     }
                     *tip = commit;
                 }
-                None => endpoint.refs.branches.push((branch.clone(), commit)),
+                None => {
+                    if !endpoint.objects.contains_key(&SourceId::Commit(commit)) {
+                        return Err(VersionError::ChunkNotFound(commit.to_hex()));
+                    }
+                    endpoint.refs.branches.push((branch.clone(), commit));
+                }
             }
             Ok(Response::Ok)
         }
         Request::ReplaceRefs(refs) => {
+            for (_, commit) in &refs.branches {
+                walk_objects(&endpoint.objects, &endpoint.snap_lists, *commit)?;
+            }
             endpoint.refs = refs;
             Ok(Response::Ok)
         }
@@ -355,11 +397,17 @@ fn walk_objects(
         let Some(bytes) = objects.get(&id) else {
             return Err(VersionError::ChunkNotFound(id.to_hex()));
         };
+        crate::remote_wire::verify_object(&id, bytes)?;
         let commit = decode_v2(bytes)?;
         stack.extend(commit.parents);
         if let Some(snaps) = snap_lists.get(&commit_id) {
             for snap in snaps {
-                seen.insert(SourceId::Snapshot(*snap));
+                let snapshot_id = SourceId::Snapshot(*snap);
+                let bytes = objects
+                    .get(&snapshot_id)
+                    .ok_or_else(|| VersionError::ChunkNotFound(snapshot_id.to_hex()))?;
+                crate::remote_wire::verify_object(&snapshot_id, bytes)?;
+                seen.insert(snapshot_id);
             }
         }
     }
@@ -369,23 +417,28 @@ fn walk_objects(
 }
 
 /// Is `ancestor` reachable from `tip` through parent links in `objects`?
-fn is_ancestor(objects: &HashMap<SourceId, Vec<u8>>, ancestor: CommitId, tip: CommitId) -> bool {
+fn is_ancestor(
+    objects: &HashMap<SourceId, Vec<u8>>,
+    ancestor: CommitId,
+    tip: CommitId,
+) -> VersionResult<bool> {
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![tip];
     while let Some(commit_id) = stack.pop() {
         if commit_id == ancestor {
-            return true;
+            return Ok(true);
         }
         if !seen.insert(commit_id) {
             continue;
         }
-        if let Some(bytes) = objects.get(&SourceId::Commit(commit_id)) {
-            if let Ok(commit) = decode_v2(bytes) {
-                stack.extend(commit.parents);
-            }
-        }
+        let id = SourceId::Commit(commit_id);
+        let bytes = objects
+            .get(&id)
+            .ok_or_else(|| VersionError::ChunkNotFound(id.to_hex()))?;
+        crate::remote_wire::verify_object(&id, bytes)?;
+        stack.extend(decode_v2(bytes)?.parents);
     }
-    false
+    Ok(false)
 }
 
 /// A `file://` remote: a directory of `refs`, `objects/<hex>`, and
@@ -438,7 +491,9 @@ impl FileTransport {
             if !seen.insert(commit_id) {
                 continue;
             }
-            let bytes = self.read_object(&SourceId::Commit(commit_id))?;
+            let id = SourceId::Commit(commit_id);
+            let bytes = self.read_object(&id)?;
+            crate::remote_wire::verify_object(&id, &bytes)?;
             let commit = decode_v2(&bytes)?;
             stack.extend(commit.parents);
         }
@@ -449,19 +504,80 @@ impl FileTransport {
 /// Write bytes to a temp file next to `path`, then rename over it. The
 /// rename is the visibility point: readers see the old or the new bytes,
 /// never a half-written file (B3).
-fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> VersionResult<()> {
+fn write_atomically(path: &Path, bytes: &[u8]) -> VersionResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| VersionError::RemoteStorageFailed(format!("{path:?}: {e}")))?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)
-        .map_err(|e| VersionError::RemoteStorageFailed(format!("{path:?}: {e}")))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| VersionError::RemoteStorageFailed(format!("{path:?}: {e}")))
+    let (tmp, mut file) = create_temp_file(path)?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(VersionError::RemoteStorageFailed(format!(
+            "{path:?}: {error}"
+        )));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(VersionError::RemoteStorageFailed(format!(
+            "{path:?}: {error}"
+        )));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| VersionError::RemoteStorageFailed(format!("{path:?}: {e}")))?;
+    }
+    Ok(())
+}
+
+fn create_temp_file(path: &Path) -> VersionResult<(PathBuf, std::fs::File)> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    let Some(parent) = path.parent() else {
+        return Err(VersionError::RemoteStorageFailed(format!(
+            "{path:?}: path has no parent"
+        )));
+    };
+    let Some(file_name) = path.file_name() else {
+        return Err(VersionError::RemoteStorageFailed(format!(
+            "{path:?}: path has no file name"
+        )));
+    };
+    loop {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), serial));
+        let temp_path = parent.join(temp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(VersionError::RemoteStorageFailed(format!(
+                    "{path:?}: {error}"
+                )))
+            }
+        }
+    }
 }
 
 impl RemoteTransport for FileTransport {
+    fn initialize(&self) -> VersionResult<()> {
+        if !self.refs_path().exists() {
+            self.write_refs(&RemoteRefs {
+                default_branch: "main".to_string(),
+                branches: Vec::new(),
+            })?;
+        }
+        Ok(())
+    }
+
     fn get_refs(&self) -> VersionResult<Vec<u8>> {
         let raw =
             std::fs::read(self.refs_path()).map_err(|_| VersionError::FailedReadRemoteRefs)?;
@@ -499,36 +615,56 @@ impl RemoteTransport for FileTransport {
                 continue;
             }
             let bytes = self.read_object(&SourceId::Commit(commit_id))?;
+            crate::remote_wire::verify_object(&SourceId::Commit(commit_id), &bytes)?;
             let commit = decode_v2(&bytes)?;
             stack.extend(commit.parents);
-            if let Ok(list) = std::fs::read_to_string(self.snaps_path(&commit_id)) {
+            let snaps_path = self.snaps_path(&commit_id);
+            if snaps_path.exists() {
+                let list = std::fs::read_to_string(&snaps_path).map_err(|e| {
+                    VersionError::RemoteStorageFailed(format!("{snaps_path:?}: {e}"))
+                })?;
                 let snaps: Vec<SnapshotId> = list
                     .lines()
                     .filter(|line| !line.is_empty())
-                    .filter_map(|line| {
-                        let bytes = hex::decode(line).ok()?;
-                        bytes.try_into().ok()
+                    .map(|line| {
+                        let bytes =
+                            hex::decode(line).map_err(|_| VersionError::InvalidSnapshotEncoding)?;
+                        let bytes: [u8; 20] = bytes
+                            .try_into()
+                            .map_err(|_| VersionError::InvalidSnapshotEncoding)?;
+                        Ok(SnapshotId(bytes))
                     })
-                    .map(SnapshotId)
-                    .collect();
+                    .collect::<VersionResult<_>>()?;
+                for snapshot in &snaps {
+                    let id = SourceId::Snapshot(*snapshot);
+                    let bytes = self.read_object(&id)?;
+                    crate::remote_wire::verify_object(&id, &bytes)?;
+                    objects.insert(id, bytes);
+                }
                 snap_lists.insert(commit_id, snaps);
             }
             objects.insert(SourceId::Commit(commit_id), bytes);
-        }
-        // Snapshot bytes are not needed for the id closure, only presence.
-        for snaps in snap_lists.values() {
-            for snap in snaps {
-                objects.insert(SourceId::Snapshot(*snap), Vec::new());
-            }
         }
         walk_objects(&objects, &snap_lists, tip)
     }
 
     fn has_many(&self, ids: &[SourceId]) -> VersionResult<Vec<bool>> {
-        Ok(ids.iter().map(|id| self.object_path(id).exists()).collect())
+        if ids.len() > SYNC_BATCH_SIZE {
+            return Err(VersionError::FetchFailed);
+        }
+        Ok(ids
+            .iter()
+            .map(|id| {
+                self.read_object(id)
+                    .is_ok_and(|bytes| crate::remote_wire::verify_object(id, &bytes).is_ok())
+            })
+            .collect())
     }
 
     fn get_batch(&self, ids: &[SourceId]) -> VersionResult<Vec<(SourceId, Vec<u8>)>> {
+        if ids.len() > SYNC_BATCH_SIZE {
+            return Err(VersionError::FetchFailed);
+        }
         let mut objects = Vec::with_capacity(ids.len());
         for id in ids {
             objects.push((*id, self.read_object(id)?));
@@ -541,6 +677,12 @@ impl RemoteTransport for FileTransport {
         objects: &[(SourceId, Vec<u8>)],
         snap_lists: &[(CommitId, Vec<SnapshotId>)],
     ) -> VersionResult<()> {
+        if objects.len() > SYNC_BATCH_SIZE {
+            return Err(VersionError::FetchFailed);
+        }
+        for (id, bytes) in objects {
+            crate::remote_wire::verify_object(id, bytes)?;
+        }
         for (id, bytes) in objects {
             write_atomically(&self.object_path(id), bytes)?;
         }
@@ -550,13 +692,34 @@ impl RemoteTransport for FileTransport {
                 .map(|s| s.to_hex())
                 .collect::<Vec<_>>()
                 .join("\n");
-            write_atomically(&self.snaps_path(commit), body.as_bytes())?;
+            let path = self.snaps_path(commit);
+            if path.exists() {
+                let existing = std::fs::read(&path).map_err(|error| {
+                    VersionError::RemoteStorageFailed(format!("{path:?}: {error}"))
+                })?;
+                if existing != body.as_bytes() {
+                    return Err(VersionError::RemoteStorageFailed(format!(
+                        "snapshot list changed for {}",
+                        commit.to_hex()
+                    )));
+                }
+            } else {
+                write_atomically(&path, body.as_bytes())?;
+            }
         }
         Ok(())
     }
 
     fn update_branch(&self, branch: &str, commit: CommitId, force: bool) -> VersionResult<()> {
-        let mut refs = self.load_refs()?;
+        self.walk(commit)?;
+        let mut refs = if self.refs_path().exists() {
+            self.load_refs()?
+        } else {
+            RemoteRefs {
+                default_branch: "main".to_string(),
+                branches: Vec::new(),
+            }
+        };
         let existing_tip = refs
             .branches
             .iter()
@@ -579,6 +742,9 @@ impl RemoteTransport for FileTransport {
     }
 
     fn replace_refs(&self, refs: &RemoteRefs) -> VersionResult<()> {
+        for (_, commit) in &refs.branches {
+            self.walk(*commit)?;
+        }
         self.write_refs(refs)
     }
 }
@@ -767,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn transport_ref_never_moves_to_an_incomplete_closure() {
+        let mut endpoint = MemEndpoint::new("main");
+        let (commit, bytes) = commit_obj(1, vec![]);
+        let missing = SnapshotId([0xCD; 20]);
+        endpoint.objects.insert(SourceId::Commit(commit), bytes);
+        endpoint.snap_lists.insert(commit, vec![missing]);
+
+        let error = serve(
+            &mut endpoint,
+            Request::UpdateBranch {
+                branch: "main".to_string(),
+                commit,
+                force: false,
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, VersionError::ChunkNotFound(missing.to_hex()));
+        assert!(endpoint.refs.branches.is_empty());
+    }
+
+    #[test]
     fn transport_file_roundtrip_and_corrupt_refs() {
         let dir = tempfile::tempdir().unwrap();
         let t = FileTransport::open(dir.path().to_path_buf());
@@ -838,11 +1026,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = FileTransport::open(dir.path().to_path_buf());
         let (id, bytes) = commit_obj(1, vec![]);
-        let snap = SnapshotId([0xEE; 20]);
+        let snapshot = crate::staging::TableSnapshot {
+            columns: vec!["id".to_string()],
+            pk: vec!["id".to_string()],
+            rows: vec![crate::vtab_log::VcRow::new(vec![
+                crate::vtab_log::VcValue::Integer(1),
+            ])],
+            schema_sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)".to_string(),
+        };
+        let (snap, snap_bytes) = crate::remote_wire::encode_snapshot_record(&id, "t", &snapshot);
         t.put_batch(
             &[
                 (SourceId::Commit(id), bytes),
-                (SourceId::Snapshot(snap), vec![7; 33]),
+                (SourceId::Snapshot(snap), snap_bytes),
             ],
             &[(id, vec![snap])],
         )
@@ -855,5 +1051,12 @@ mod tests {
     #[test]
     fn transport_batch_size_constant() {
         assert_eq!(SYNC_BATCH_SIZE, 256);
+
+        let mut endpoint = MemEndpoint::new("main");
+        let ids = vec![SourceId::Commit(CommitId([0; 20])); SYNC_BATCH_SIZE + 1];
+        assert_eq!(
+            serve(&mut endpoint, Request::HasMany(ids), None).unwrap_err(),
+            VersionError::FetchFailed
+        );
     }
 }

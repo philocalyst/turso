@@ -1,0 +1,6 @@
+# Turso keeps SQLite's SQL-facing rowid behavior. Versioned snapshots store declared columns only.
+versioning_manifest_magic_is_not_sqlite	src/model.rs::pub const DLTC
+notadb_on_mismatch	src/model.rs::fn model_manifest_rejects_bad_magic
+integer_pk_is_rowid_alias	../../sqlite/conformance/turso-sqltests/vc_compat.sqltest::rowid == id
+versioned_identity_is_pk_never_rowid	tests/compat_contract.rs::compat_pk_identity_ignores_physical_row_order
+non_integer_pk_tables_are_clustered_by_pk	tests/compat_contract.rs::compat_non_integer_pk_sorts_snapshot_rows

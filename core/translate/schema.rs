@@ -1145,11 +1145,8 @@ pub fn translate_create_table(
     validate(&body, &normalized_tbl_name, resolver, connection)?;
 
     // Version-control hook: a freshly created table is an uncommitted change
-    // in the connection's working set. Translation time is an over-approximation:
-    // the statement can still fail at execution (e.g. a duplicate table name), so
-    // the tracked name may never exist in the schema. That is fine — the working
-    // set is advisory, and a stale name just reads as an uncommitted change until
-    // it is reset or overwritten.
+    // in the connection's working set. Translation happens before execution,
+    // so capture later discards this entry if CREATE fails or is rolled back.
     if let Some(vc) = &connection.versioning {
         vc.track_table(&normalized_tbl_name);
     }

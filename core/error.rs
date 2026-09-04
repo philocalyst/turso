@@ -73,6 +73,11 @@ pub enum LimboError {
     ReadOnly,
     #[error("Database is busy")]
     Busy,
+    /// A non-retryable refusal that still carries SQLITE_BUSY semantics.
+    /// Unlike lock contention, retrying this operation without changing the
+    /// caller's state cannot make progress, so preserve its useful message.
+    #[error("{0}")]
+    BusyMessage(String),
     /// A transaction-control or savepoint operation, or a second concurrent
     /// write statement, was rejected because another statement on the same
     /// connection is still in progress. This carries SQLITE_BUSY semantics at
@@ -166,7 +171,10 @@ impl LimboError {
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
             Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
-            Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+            Self::Busy
+            | Self::BusyMessage(_)
+            | Self::BusySnapshot
+            | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,

@@ -133,7 +133,16 @@ impl VcState {
         };
         let mut captured: Vec<(String, TableCapture)> = Vec::new();
         for t in &names {
-            captured.push((t.clone(), read_table(unsafe { &*conn }, t)?));
+            match read_table(unsafe { &*conn }, t) {
+                Ok(table) => captured.push((t.clone(), table)),
+                Err(VersionError::TableNotFound(_))
+                    if self
+                        .store
+                        .lock()
+                        .unwrap()
+                        .discard_missing_uncommitted_table(t) => {}
+                Err(error) => return Err(error),
+            }
         }
         let mut store = self.store.lock().unwrap();
         for (table, (columns, pk, rows, schema_sql)) in captured {
@@ -162,20 +171,41 @@ impl VcState {
             return Ok(());
         };
         let conn = unsafe { &*conn };
-        let (resolutions, changes) = {
+        let (resolutions, changes, expected_store) = {
             let mut store = self.store.lock().unwrap();
-            (store.take_pending_resolve(), store.take_work_changes())
+            let resolutions = store.take_pending_resolve();
+            let changes = store.take_work_changes();
+            let expected_store = store.clone();
+            (resolutions, changes, expected_store)
         };
         // Save copies so a write-back failure can restore the drained state.
         let saved_resolutions = resolutions.clone();
         let dirty_names: Vec<String> = changes.iter().map(|(t, _)| t.clone()).collect();
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Arc::new(crate::Connection::new(conn as *const crate::vtabs::Conn));
-        execute_sql(&connection, "SAVEPOINT turso_vc_sync", Vec::new())?;
+        if let Err(error) = execute_sql(&connection, "SAVEPOINT turso_vc_sync", Vec::new()) {
+            let mut store = self.store.lock().unwrap();
+            *store = expected_store;
+            store.restore_pending_resolve(saved_resolutions);
+            store.restore_dirty_work(dirty_names);
+            return Err(error);
+        }
         let result = sync_write_back(&connection, &resolutions, &changes);
         match result {
             Ok(()) => {
-                execute_sql(&connection, "RELEASE turso_vc_sync", Vec::new())?;
+                if let Err(error) = execute_sql(&connection, "RELEASE turso_vc_sync", Vec::new()) {
+                    let _ = execute_sql(&connection, "ROLLBACK TO turso_vc_sync", Vec::new());
+                    let _ = execute_sql(&connection, "RELEASE turso_vc_sync", Vec::new());
+                    let mut store = self.store.lock().unwrap();
+                    *store = expected_store;
+                    store.restore_pending_resolve(saved_resolutions);
+                    store.restore_dirty_work(dirty_names);
+                    return Err(error);
+                }
+                // Nested CREATE/DROP statements pass through the normal SQL
+                // hooks. The store already describes this write-back, so
+                // discard those duplicate hook mutations.
+                *self.store.lock().unwrap() = expected_store;
             }
             Err(e) => {
                 let _ = execute_sql(&connection, "ROLLBACK TO turso_vc_sync", Vec::new());
@@ -185,6 +215,7 @@ impl VcState {
                 // rolled back by the SAVEPOINT; the store working set is the
                 // source of truth and must remain retryable.
                 let mut store = self.store.lock().unwrap();
+                *store = expected_store;
                 store.restore_pending_resolve(saved_resolutions);
                 store.restore_dirty_work(dirty_names);
                 return Err(e);
@@ -196,6 +227,10 @@ impl VcState {
     /// Record a table as known to version control (the CREATE TABLE hook).
     pub fn track_table(&self, name: &str) {
         self.store.lock().unwrap().track_table(name);
+    }
+
+    pub fn drop_table(&self, name: &str) -> VersionResult<()> {
+        self.store.lock().unwrap().drop_table(name)
     }
 
     /// Attach to a named branch, clearing any detached pin.
@@ -232,6 +267,40 @@ impl VcState {
     pub fn with_store<R>(&self, f: impl FnOnce(&VcStore) -> R) -> R {
         f(&self.store.lock().unwrap())
     }
+
+    pub fn note_txn_event(&self, event: &str) {
+        self.store.lock().unwrap().note_txn_event(event);
+    }
+
+    pub fn has_versioned_content(&self) -> bool {
+        self.store.lock().unwrap().has_versioned_content()
+    }
+
+    pub fn compact_gc(&self) {
+        turso_versioning::gc::gc_compact(&mut self.store.lock().unwrap());
+    }
+
+    /// Materialize a lazy clone and install its tables into SQL on the first
+    /// lookup of a table that is not present locally yet.
+    pub fn materialize_lazy_to_sql(&self) -> VersionResult<bool> {
+        let before = self.with_store(Clone::clone);
+        {
+            let mut store = self.store.lock().unwrap();
+            if store.lazy_origin().is_none() {
+                return Ok(false);
+            }
+            if let Err(error) = store.materialize() {
+                *store = before;
+                return Err(error);
+            }
+            store.sync_work_to_head();
+        }
+        if let Err(error) = self.sync_work_to_sql() {
+            *self.store.lock().unwrap() = before;
+            return Err(error);
+        }
+        Ok(true)
+    }
 }
 
 /// Run a `dolt_*` dispatch against the store and render the outcome as a
@@ -244,10 +313,10 @@ fn dispatch(state: &VcState, f: impl FnOnce(&mut VcStore) -> VersionResult<FuncV
     let mut store = state.store.lock().unwrap();
     match f(&mut store) {
         Ok(value) => func_value_to_value(value),
-        Err(VersionError::DatabaseLocked) => Value::error_with_code_message(
-            ResultCode::Busy,
-            VersionError::DatabaseLocked.to_string(),
-        ),
+        Err(VersionError::DatabaseLocked) => Value::error(ResultCode::Busy),
+        Err(e @ VersionError::GcRequiresExclusiveAccess) => {
+            Value::error_with_code_message(ResultCode::Busy, e.to_string())
+        }
         Err(e) => Value::error_with_message(e.to_string()),
     }
 }
@@ -264,7 +333,9 @@ fn func_arg(v: &Value) -> FuncArg<'_> {
     match v.value_type() {
         ValueType::Text => FuncArg::Text(v.to_text().unwrap_or("")),
         ValueType::Integer => FuncArg::Integer(v.to_integer().unwrap_or(0)),
-        _ => FuncArg::Null,
+        ValueType::Float => FuncArg::Real(v.to_float().unwrap_or(0.0).to_bits()),
+        ValueType::Blob => FuncArg::Blob(v.blob_ref().unwrap_or_default()),
+        ValueType::Null | ValueType::Error => FuncArg::Null,
     }
 }
 
@@ -299,12 +370,11 @@ vc_shim!(dolt_branch_shim, funcs::dolt_branch);
 vc_shim!(dolt_tag_shim, funcs::dolt_tag);
 vc_shim!(dolt_active_branch_shim, funcs::dolt_active_branch);
 vc_shim!(dolt_hashof_shim, funcs::dolt_hashof);
-vc_shim!(dolt_hashof_table_shim, funcs::dolt_hashof_table);
-vc_shim!(dolt_hashof_db_shim, funcs::dolt_hashof_db);
 vc_shim!(dolt_config_shim, funcs::dolt_config);
-vc_shim!(dolt_reset_shim, funcs::dolt_reset);
-vc_shim!(dolt_clean_shim, funcs::dolt_clean);
 vc_shim!(dolt_merge_base_shim, funcs::dolt_merge_base);
+vc_shim!(dolt_remote_shim, funcs::dolt_remote);
+vc_shim!(dolt_push_shim, funcs::dolt_push);
+vc_shim!(dolt_fetch_shim, funcs::dolt_fetch);
 
 /// `dolt_add` and `dolt_status` observe the working set, which mirrors the
 /// SQL tables only at sync points. Sync first so `-A` sees writes made since
@@ -341,6 +411,101 @@ unsafe extern "C" fn dolt_status_shim(
     dispatch(state, |store| funcs::dolt_status(store, &fargs))
 }
 
+unsafe extern "C" fn dolt_reset_shim(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    _cd: Option<ContextDestructor>,
+    _vd: Option<ValueDestructor>,
+) -> Value {
+    let state = unsafe { &*(context as *const VcState) };
+    if let Err(error) = state.sync_sql_to_work() {
+        return Value::error_with_message(error.to_string());
+    }
+    let before = state.with_store(Clone::clone);
+    let args = args_slice(argc, argv);
+    let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+    let result = dispatch(state, |store| funcs::dolt_reset(store, &fargs));
+    if result.value_type() != ValueType::Error {
+        if let Err(error) = state.sync_work_to_sql() {
+            *state.store.lock().unwrap() = before;
+            return Value::error_with_message(error.to_string());
+        }
+    }
+    result
+}
+
+unsafe extern "C" fn dolt_gc_shim(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    _cd: Option<ContextDestructor>,
+    _vd: Option<ValueDestructor>,
+) -> Value {
+    let state = unsafe { &*(context as *const VcState) };
+    if let Err(error) = state.sync_sql_to_work() {
+        return Value::error_with_message(error.to_string());
+    }
+    let args = args_slice(argc, argv);
+    let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+    dispatch(state, |store| funcs::dolt_gc(store, &fargs))
+}
+
+unsafe extern "C" fn dolt_clean_shim(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    _cd: Option<ContextDestructor>,
+    _vd: Option<ValueDestructor>,
+) -> Value {
+    let state = unsafe { &*(context as *const VcState) };
+    if let Err(e) = state.sync_sql_to_work() {
+        return Value::error_with_message(e.to_string());
+    }
+    let before = state.with_store(Clone::clone);
+    let before_tables = before.tables();
+    let args = args_slice(argc, argv);
+    let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+    let result = dispatch(state, |store| funcs::dolt_clean(store, &fargs));
+    if result.value_type() == ValueType::Error {
+        return result;
+    }
+    let after_tables = state.with_store(VcStore::tables);
+    let removed: Vec<String> = before_tables
+        .into_iter()
+        .filter(|table| !after_tables.contains(table))
+        .collect();
+    if let Err(e) = drop_sql_tables(state, &removed) {
+        *state.store.lock().unwrap() = before;
+        return Value::error_with_message(e.to_string());
+    }
+    result
+}
+
+fn drop_sql_tables(state: &VcState, tables: &[String]) -> VersionResult<()> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let Some(conn) = state.with_conn(|conn| conn as *const _) else {
+        return Ok(());
+    };
+    #[allow(clippy::arc_with_non_send_sync)]
+    let connection = Arc::new(crate::Connection::new(conn));
+    execute_sql(&connection, "SAVEPOINT turso_vc_clean", Vec::new())?;
+    for table in tables {
+        if let Err(error) = execute_sql(
+            &connection,
+            &format!("DROP TABLE {}", quote_ident(table)),
+            Vec::new(),
+        ) {
+            let _ = execute_sql(&connection, "ROLLBACK TO turso_vc_clean", Vec::new());
+            let _ = execute_sql(&connection, "RELEASE turso_vc_clean", Vec::new());
+            return Err(error);
+        }
+    }
+    execute_sql(&connection, "RELEASE turso_vc_clean", Vec::new())
+}
+
 /// A checkout switches the working set to the new branch's committed content,
 /// so the SQL tables rewrite to that branch's state before any capture.
 unsafe extern "C" fn dolt_checkout_shim(
@@ -351,14 +516,25 @@ unsafe extern "C" fn dolt_checkout_shim(
     _vd: Option<ValueDestructor>,
 ) -> Value {
     let state = unsafe { &*(context as *const VcState) };
+    if let Err(error) = state.sync_sql_to_work() {
+        return Value::error_with_message(error.to_string());
+    }
+    let before_store = state.with_store(Clone::clone);
+    let before_session = state.session.lock().unwrap().clone();
     let args = args_slice(argc, argv);
     let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
     let result = dispatch(state, |store| funcs::dolt_checkout(store, &fargs));
+    if result.value_type() == ValueType::Error {
+        return result;
+    }
+    if let Some(branch) = args.first().and_then(Value::to_text) {
+        state.session.lock().unwrap().checkout(branch);
+    }
     state.sync_work_to_head();
-    if let Err(e) = state.sync_work_to_sql() {
-        if result.value_type() != ValueType::Error {
-            return Value::error_with_message(e.to_string());
-        }
+    if let Err(error) = state.sync_work_to_sql() {
+        *state.store.lock().unwrap() = before_store;
+        *state.session.lock().unwrap() = before_session;
+        return Value::error_with_message(error.to_string());
     }
     result
 }
@@ -407,12 +583,52 @@ vc_sync_shim!(
     false,
     true
 );
+
+macro_rules! vc_atomic_sync_shim {
+    ($name:ident, $op:path, $capture:expr) => {
+        unsafe extern "C" fn $name(
+            context: usize,
+            argc: i32,
+            argv: *const Value,
+            _cd: Option<ContextDestructor>,
+            _vd: Option<ValueDestructor>,
+        ) -> Value {
+            let state = unsafe { &*(context as *const VcState) };
+            if $capture {
+                if let Err(e) = state.sync_sql_to_work() {
+                    return Value::error_with_message(e.to_string());
+                }
+            }
+            let before = state.with_store(Clone::clone);
+            let args = args_slice(argc, argv);
+            let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+            let result = dispatch(state, |store| $op(store, &fargs));
+            if result.value_type() != ValueType::Error {
+                if let Err(e) = state.sync_work_to_sql() {
+                    *state.store.lock().unwrap() = before;
+                    return Value::error_with_message(e.to_string());
+                }
+            }
+            result
+        }
+    };
+}
+
+vc_atomic_sync_shim!(dolt_pull_shim, funcs::dolt_pull, true);
+vc_atomic_sync_shim!(dolt_clone_shim, funcs::dolt_clone, false);
 vc_sync_shim!(
     dolt_verify_constraints_shim,
     funcs::dolt_verify_constraints,
     true,
     false
 );
+vc_sync_shim!(
+    dolt_hashof_table_shim,
+    funcs::dolt_hashof_table,
+    true,
+    false
+);
+vc_sync_shim!(dolt_hashof_db_shim, funcs::dolt_hashof_db, true, false);
 
 /// The commit shim additionally holds the graph lock  across the plan→compare-and-swap
 /// window. The in-memory store's own mutex already serializes the compare-and-swap; the
@@ -458,6 +674,8 @@ macro_rules! vc_stateless_shim {
 
 vc_stateless_shim!(dolt_version_shim, funcs::dolt_version);
 vc_stateless_shim!(doltlite_engine_shim, funcs::doltlite_engine);
+vc_stateless_shim!(dolt_creds_new_shim, funcs::dolt_creds_new);
+vc_stateless_shim!(dolt_creds_shim, funcs::dolt_creds);
 
 unsafe extern "C" fn drop_vc_state(context: usize) {
     if context != 0 {
@@ -490,6 +708,14 @@ pub fn register_vc_functions(api: &ExtensionApi, state: Arc<VcState>) {
         ("dolt_rebase", dolt_rebase_shim),
         ("dolt_conflicts_resolve", dolt_conflicts_resolve_shim),
         ("dolt_verify_constraints", dolt_verify_constraints_shim),
+        ("dolt_remote", dolt_remote_shim),
+        ("dolt_push", dolt_push_shim),
+        ("dolt_fetch", dolt_fetch_shim),
+        ("dolt_pull", dolt_pull_shim),
+        ("dolt_clone", dolt_clone_shim),
+        ("dolt_gc", dolt_gc_shim),
+        ("dolt_creds_new", dolt_creds_new_shim),
+        ("dolt_creds", dolt_creds_shim),
         ("dolt_version", dolt_version_shim),
         ("doltlite_engine", doltlite_engine_shim),
     ];
@@ -655,13 +881,20 @@ fn write_table_body(
 fn sync_write_back(
     connection: &Arc<crate::Connection>,
     resolutions: &[(String, Vec<VcValue>, Option<VcRow>)],
-    changes: &[(String, turso_versioning::staging::TableSnapshot)],
+    changes: &[(String, Option<turso_versioning::staging::TableSnapshot>)],
 ) -> VersionResult<()> {
     for (table, pk, image) in resolutions {
         apply_resolution_image_conn(connection, table, pk, image.as_ref())?;
     }
-    for (table, snap) in changes {
-        write_table_snapshot(connection, table, snap)?;
+    for (table, snapshot) in changes {
+        match snapshot {
+            Some(snapshot) => write_table_snapshot(connection, table, snapshot)?,
+            None => execute_sql(
+                connection,
+                &format!("DROP TABLE IF EXISTS {}", quote_ident(table)),
+                Vec::new(),
+            )?,
+        }
     }
     Ok(())
 }
@@ -702,9 +935,9 @@ fn apply_resolution_image_conn(
             pk.len()
         )));
     }
-    let where_clause = positions
+    let where_clause = pk_names
         .iter()
-        .map(|_| "?")
+        .map(|name| format!("{} IS ?", quote_ident(name)))
         .collect::<Vec<_>>()
         .join(" AND ");
     let delete = format!("DELETE FROM {} WHERE {}", quote_ident(table), where_clause);
@@ -751,8 +984,10 @@ fn execute_sql(
 fn value_to_vc(v: &Value) -> VcValue {
     match v.value_type() {
         ValueType::Integer => VcValue::Integer(v.to_integer().unwrap_or(0)),
+        ValueType::Float => VcValue::real(v.to_float().unwrap_or(0.0)),
         ValueType::Text => VcValue::Text(v.to_text().unwrap_or("").to_string()),
-        _ => VcValue::Null,
+        ValueType::Blob => VcValue::Blob(v.to_blob().unwrap_or_default()),
+        ValueType::Null | ValueType::Error => VcValue::Null,
     }
 }
 
@@ -760,7 +995,9 @@ fn vc_to_value(v: &VcValue) -> Value {
     match v {
         VcValue::Null => Value::null(),
         VcValue::Integer(i) => Value::from_integer(*i),
+        VcValue::Real(bits) => Value::from_float(f64::from_bits(*bits)),
         VcValue::Text(s) => Value::from_text(s.clone()),
+        VcValue::Blob(bytes) => Value::from_blob(bytes.clone()),
     }
 }
 
@@ -775,6 +1012,14 @@ mod tests {
             FuncArg::Text("hi")
         );
         assert_eq!(func_arg(&Value::from_integer(7)), FuncArg::Integer(7));
+        assert_eq!(
+            func_arg(&Value::from_float(1.5)),
+            FuncArg::Real(1.5f64.to_bits())
+        );
+        assert_eq!(
+            func_arg(&Value::from_blob(vec![0x00, 0xff])),
+            FuncArg::Blob(&[0x00, 0xff])
+        );
         assert_eq!(func_arg(&Value::null()), FuncArg::Null);
     }
 
@@ -791,6 +1036,23 @@ mod tests {
     }
 
     #[test]
+    fn sql_value_conversion_preserves_real_and_blob() {
+        let real = value_to_vc(&Value::from_float(-0.0));
+        assert_eq!(real, VcValue::real(-0.0));
+        assert_eq!(
+            vc_to_value(&real).to_float().unwrap().to_bits(),
+            (-0.0f64).to_bits()
+        );
+
+        let blob = value_to_vc(&Value::from_blob(vec![0x00, 0x7f, 0xff]));
+        assert_eq!(blob, VcValue::Blob(vec![0x00, 0x7f, 0xff]));
+        assert_eq!(
+            vc_to_value(&blob).to_blob().unwrap(),
+            vec![0x00, 0x7f, 0xff]
+        );
+    }
+
+    #[test]
     fn dispatch_renders_errors_as_messages() {
         let state = VcState::new();
         let value = dispatch(&state, |store| {
@@ -803,7 +1065,14 @@ mod tests {
         let busy = dispatch(&state, |_store| Err(VersionError::DatabaseLocked));
         let (code, msg) = busy.to_error_details().unwrap();
         assert_eq!(code, crate::ResultCode::Busy);
-        assert_eq!(msg.as_deref(), Some("database is locked"));
+        assert_eq!(msg, None);
+
+        let exclusive = dispatch(&state, |_store| {
+            Err(VersionError::GcRequiresExclusiveAccess)
+        });
+        let (code, msg) = exclusive.to_error_details().unwrap();
+        assert_eq!(code, crate::ResultCode::Busy);
+        assert_eq!(msg.as_deref(), Some("gc requires exclusive access"));
     }
 
     #[test]

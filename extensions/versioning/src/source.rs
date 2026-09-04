@@ -11,11 +11,10 @@ use crate::refs::RefStore;
 use crate::remote_wire::{SourceId, SYNC_BATCH_SIZE};
 use crate::staging::VcStore;
 
-/// What a lazy store can ask a source for: one object or a batch. Sources
-/// are the seam where hosts plug their own backing store. No `Send`/`Sync`
-/// bound: a source lives inside `VcStore`, which is only reachable behind
-/// the owning connection's lock.
-pub trait ChunkSource {
+/// What a lazy store can ask a source for: one object or a batch. Sources are
+/// the seam where hosts plug their own backing store and may be shared by
+/// connections.
+pub trait ChunkSource: Send + Sync {
     /// Fetch one object by id. Errors name the id.
     fn get(&self, id: SourceId) -> VersionResult<Vec<u8>>;
     /// Fetch a batch; `None` entries mean "not present" and surface as
@@ -39,13 +38,24 @@ impl OriginSource {
 impl ChunkSource for OriginSource {
     fn get(&self, id: SourceId) -> VersionResult<Vec<u8>> {
         let transport = crate::remote_transport::open_transport(&self.url)?;
-        let mut objects = transport.get_batch(&[id])?;
-        Ok(objects.remove(0).1)
+        let objects = transport.get_batch(&[id])?;
+        match objects.as_slice() {
+            [(returned, bytes)] if *returned == id => Ok(bytes.clone()),
+            _ => Err(VersionError::FetchFailed),
+        }
     }
 
     fn get_many(&self, ids: &[SourceId]) -> VersionResult<Vec<Option<Vec<u8>>>> {
         let transport = crate::remote_transport::open_transport(&self.url)?;
         let objects = transport.get_batch(ids)?;
+        if objects.len() != ids.len()
+            || objects
+                .iter()
+                .zip(ids)
+                .any(|((id, _), expected)| id != expected)
+        {
+            return Err(VersionError::FetchFailed);
+        }
         Ok(objects.into_iter().map(|(_, bytes)| Some(bytes)).collect())
     }
 }
@@ -58,6 +68,9 @@ impl VcStore {
         let missing = self.missing_for(tip)?;
         for batch in missing.chunks(SYNC_BATCH_SIZE) {
             let fetched = source.get_many(batch)?;
+            if fetched.len() != batch.len() {
+                return Err(VersionError::FetchFailed);
+            }
             // Verify and decode the whole batch before storing any of it:
             // one batch is one atomic insert set.
             let mut staged = Vec::with_capacity(batch.len());
@@ -80,6 +93,10 @@ impl VcStore {
         let Some(url) = self.lazy_origin.clone() else {
             return Ok(());
         };
+        if !self.lazy_catalog.contains_key(&tip) {
+            let ids = crate::remote_transport::open_transport(&url)?.walk(tip)?;
+            self.note_lazy_catalog(tip, ids);
+        }
         let source = OriginSource::new(&url);
         self.hydrate_with(&source, tip)
     }
@@ -153,43 +170,45 @@ fn ingest(store: &mut VcStore, id: &SourceId, bytes: &[u8]) -> VersionResult<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// A counting fake source: serves programmed bytes, counts calls.
     struct Fake {
-        objects: RefCell<std::collections::HashMap<SourceId, Vec<u8>>>,
-        gets: std::cell::Cell<usize>,
-        batches: std::cell::Cell<usize>,
-        fail_batches: std::cell::Cell<bool>,
+        objects: Mutex<std::collections::HashMap<SourceId, Vec<u8>>>,
+        gets: AtomicUsize,
+        batches: AtomicUsize,
+        fail_batches: AtomicBool,
     }
 
     impl Fake {
         fn new() -> Self {
             Fake {
-                objects: RefCell::new(std::collections::HashMap::new()),
-                gets: std::cell::Cell::new(0),
-                batches: std::cell::Cell::new(0),
-                fail_batches: std::cell::Cell::new(false),
+                objects: Mutex::new(std::collections::HashMap::new()),
+                gets: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                fail_batches: AtomicBool::new(false),
             }
         }
     }
 
     impl ChunkSource for Fake {
         fn get(&self, id: SourceId) -> VersionResult<Vec<u8>> {
-            self.gets.set(self.gets.get() + 1);
+            self.gets.fetch_add(1, Ordering::Relaxed);
             self.objects
-                .borrow()
+                .lock()
+                .unwrap()
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| VersionError::ChunkNotFound(id.to_hex()))
         }
 
         fn get_many(&self, ids: &[SourceId]) -> VersionResult<Vec<Option<Vec<u8>>>> {
-            self.batches.set(self.batches.get() + 1);
-            if self.fail_batches.get() {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            if self.fail_batches.load(Ordering::Relaxed) {
                 return Err(VersionError::FetchFailed);
             }
-            let objects = self.objects.borrow();
+            let objects = self.objects.lock().unwrap();
             Ok(ids.iter().map(|id| objects.get(id).cloned()).collect())
         }
     }
@@ -234,7 +253,7 @@ mod tests {
     /// Program a source with the store's objects and record the id
     /// catalog, so a lazy hydrate knows what to ask for.
     fn seed_source(store: &VcStore, tip: CommitId, source: &Fake) -> Vec<SourceId> {
-        let mut objects = source.objects.borrow_mut();
+        let mut objects = source.objects.lock().unwrap();
         let mut catalog = vec![SourceId::Commit(tip)];
         if let Some(commit) = store.get_commit(&tip) {
             objects.insert(SourceId::Commit(tip), crate::commit::encode_v2(&commit));
@@ -272,11 +291,11 @@ mod tests {
         let mut lazy = VcStore::new("main");
         lazy.note_lazy_catalog(tip, catalog);
         lazy.hydrate_with(&fake, tip).unwrap();
-        fake.batches.set(0);
-        fake.gets.set(0);
+        fake.batches.store(0, Ordering::Relaxed);
+        fake.gets.store(0, Ordering::Relaxed);
         lazy.hydrate_with(&fake, tip).unwrap();
-        assert_eq!(fake.batches.get(), 0);
-        assert_eq!(fake.gets.get(), 0);
+        assert_eq!(fake.batches.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.gets.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -287,7 +306,7 @@ mod tests {
         let mut lazy = VcStore::new("main");
         lazy.note_lazy_catalog(tip, catalog);
         lazy.hydrate_with(&fake, tip).unwrap();
-        assert_eq!(fake.batches.get(), 1);
+        assert_eq!(fake.batches.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -308,7 +327,7 @@ mod tests {
         let catalog = seed_source(&owner, tip, &fake);
         // Corrupt the commit bytes under the same id.
         {
-            let mut objects = fake.objects.borrow_mut();
+            let mut objects = fake.objects.lock().unwrap();
             let entry = objects.get_mut(&SourceId::Commit(tip)).unwrap();
             let last = entry.len() - 1;
             entry[last] ^= 0xFF;
@@ -325,7 +344,7 @@ mod tests {
         let (owner, tip) = commit_with_snapshot(5, 2);
         let fake = Fake::new();
         let catalog = seed_source(&owner, tip, &fake);
-        fake.fail_batches.set(true);
+        fake.fail_batches.store(true, Ordering::Relaxed);
         let mut lazy = VcStore::new("main");
         lazy.note_lazy_catalog(tip, catalog);
         assert!(lazy.hydrate_with(&fake, tip).is_err());

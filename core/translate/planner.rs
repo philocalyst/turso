@@ -1834,6 +1834,18 @@ fn parse_table(
     let mut table =
         resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
+    if table.is_none() && database_id == crate::MAIN_DB_ID {
+        if let Some(versioning) = &connection.versioning {
+            if versioning
+                .materialize_lazy_to_sql()
+                .map_err(|error| crate::LimboError::SqlError(error.to_string()))?
+            {
+                table = connection
+                    .with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+            }
+        }
+    }
+
     // Per-table version-control modules (`dolt_history_<t>` and friends) register
     // reactively on first use so their create resolves the table's live columns
     // through this connection. The registration takes the user table name, not

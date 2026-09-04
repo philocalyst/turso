@@ -27,7 +27,7 @@ test vc-no-pk-divergent-inserts-conflict {
     SELECT count(*) FROM dolt_conflicts;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0$
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\nmerge conflict: 2 conflicting rows in 1 tables\n2$
 }
 
 test vc-no-pk-merge-abort-restores-rows {
@@ -52,7 +52,7 @@ test vc-no-pk-merge-abort-restores-rows {
     SELECT count(*) FROM dolt_merge_status;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nw:4,x:1,y:2\n0$
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\nmerge conflict: 2 conflicting rows in 1 tables\n0\nw:4,x:1,y:2\n0$
 }
 
 test vc-no-pk-identical-inserts-both-sides-merge-clean {
@@ -76,5 +76,5 @@ test vc-no-pk-identical-inserts-both-sides-merge-clean {
     SELECT count(*) FROM dolt_conflicts;
 }
 expect pattern {
-    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n0\nsame:2,x:1\n0$
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\ndev\ndev\n1\n[0-9a-f]{40}\nmain\n1\n[0-9a-f]{40}\n[0-9a-f]{40}\nsame:2,x:1\n0$
 }

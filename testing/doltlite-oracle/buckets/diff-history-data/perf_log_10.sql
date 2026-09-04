@@ -1,0 +1,41 @@
+.output /dev/null
+SELECT dolt_config('user.name', 'Ada');
+SELECT dolt_config('user.email', 'ada@example.com');
+CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+INSERT INTO t VALUES (0, 'seed');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'seed');
+INSERT INTO t VALUES (1, 'value-1');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-1');
+INSERT INTO t VALUES (2, 'value-2');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-2');
+INSERT INTO t VALUES (3, 'value-3');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-3');
+INSERT INTO t VALUES (4, 'value-4');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-4');
+INSERT INTO t VALUES (5, 'value-5');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-5');
+INSERT INTO t VALUES (6, 'value-6');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-6');
+INSERT INTO t VALUES (7, 'value-7');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-7');
+INSERT INTO t VALUES (8, 'value-8');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-8');
+INSERT INTO t VALUES (9, 'value-9');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-9');
+INSERT INTO t VALUES (10, 'value-10');
+SELECT dolt_add('-A');
+SELECT dolt_commit('-m', 'commit-10');
+.output /dev/null
+SELECT count(*) FROM dolt_log;
+.output stdout
+SELECT count(*) FROM t;

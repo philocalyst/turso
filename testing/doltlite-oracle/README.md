@@ -1,35 +1,55 @@
-# doltlite-oracle — differential harness vs doltlite
+# doltlite-oracle — differential harness vs DoltLite
 
-Runs the same scenario on `build/doltlite` (C, prolly-tree) and on Turso
-`extensions/versioning` (Rust, overlay) and diffs normalized output.
+The harness feeds each checked-in SQL scenario to both `tursodb` and the
+DoltLite shell, then compares normalized output and errors. It does not use
+golden output, so a scenario must be valid for both engines.
 
-## Buckets (mirror doltlite oracle-buckets)
+## Buckets
 
-- `refs-workspace` — branches, tags, checkout, detached, add/status/reset/clean
-- `diff-history-data` — diff, history, at, blame, patch, schemas
-- `merge-replay-schema` — merge, conflicts, constraints, cherry-pick, revert, rebase
-- `feature-interaction` — savepoints, cross-op conflicts, rowid, triggers
-- `remotes-recovery` — remotes, lazy source, gc, compat
+- `refs-workspace` — branches, tags, checkout, and workspace state
+- `diff-history-data` — row diffs and commit history
+- `merge-replay-schema` — merges, replay, and schema changes
+- `feature-interaction` — savepoints and combined features
+- `remotes-recovery` — reserved for O5-owned scenarios; O6 leaves its manifest empty
 
-Every `vc_oracle_*` scenario must appear in exactly one bucket; `check_buckets.sh`
-guards the total (like doltlite `check_oracle_buckets.sh`).
+Every scenario is listed exactly once in its bucket's `manifest.txt`. The
+`check-buckets` action checks that manifests do not escape their bucket and
+that every O6-owned bucket is populated.
 
-## Run
+## Run in the pinned environment
+
+Set `DOLTLITE_BIN` to the reference binary and `TURSODB_BIN` to the debug
+Turso shell. The runner defaults to `target/debug/tursodb` and `doltlite` when
+the variables are absent.
 
 ```bash
-# build both sides
-./configure && make -C build doltlite        # doltlite binary
-cargo build -p turso_versioning
-
-# deterministic sqltests (preferred)
-make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'
-
-# differential sweep (10k fixed seeds, like doltlite PR)
-cargo run -p doltlite-oracle -- --seeds 1:10000 --groups all
-
-# nightly 100k random + scale
-cargo run -p doltlite-oracle -- --random 100000 --groups all
+nix develop -c cargo run -p doltlite_oracle -- check-buckets
+nix develop -c cargo run -p doltlite_oracle -- run --batch
+nix develop -c cargo run -p doltlite_oracle -- run --filter branch_tags
+nix develop -c cargo run -p doltlite_oracle -- run --time --filter branch_tags --reps 30
 ```
 
-Output is normalized `|`-separated, `NULL` literal, sorted where `unordered`,
-hashes replaced with `<HASH>` unless testing `hashof` determinism.
+For the reference build used by O6:
+
+```bash
+nix develop -c sh -c \
+  'DOLTLITE_BIN=/private/tmp/doltlite-research/build/doltlite \
+   TURSODB_BIN=$PWD/target/debug/tursodb \
+   cargo run -p doltlite_oracle -- run --batch'
+```
+
+The deterministic generated sweep accepts an inclusive `START:END` range.
+This is useful for the 10,000-seed pass without adding generated files to the
+corpus:
+
+```bash
+nix develop -c sh -c \
+  'DOLTLITE_BIN=/private/tmp/doltlite-research/build/doltlite \
+   TURSODB_BIN=$PWD/target/debug/tursodb \
+   cargo run -p doltlite_oracle -- run --seeds 1:10000'
+```
+
+The runner prepends `.headers off` and `.mode list`, folds engine-specific
+hashes/booleans/error decoration, and prints a structured line diff on the
+first mismatch. Timing reports the median process wall time over `--reps`
+interleaved repetitions; it fails if the compared outputs differ.

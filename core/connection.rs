@@ -5182,6 +5182,9 @@ impl Connection {
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
+        if let Some(versioning) = &self.versioning {
+            versioning.note_txn_event("ROLLBACK");
+        }
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
@@ -5210,6 +5213,9 @@ impl Connection {
             self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
+            if let Some(versioning) = &self.versioning {
+                versioning.note_txn_event("ROLLBACK");
+            }
         }
 
         self.rollback_temp_schema();

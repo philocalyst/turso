@@ -1,0 +1,41 @@
+@database :memory:
+
+test vc-remotes-push-fetch-and-vtabs {
+    SELECT dolt_config('user.name', 'Ada');
+    SELECT dolt_config('user.email', 'ada@example.com');
+    CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+    INSERT INTO items VALUES (1, 'one');
+    SELECT dolt_add('items');
+    SELECT dolt_commit('seed');
+    SELECT dolt_remote('add', '  origin  ', 'mem://sql-vc-remotes-flow');
+    SELECT name, url, fetch_specs, params = '{}' FROM dolt_remotes;
+    SELECT dolt_push('origin', 'main');
+    SELECT dolt_fetch('origin');
+    SELECT name, latest_commit_message FROM dolt_remote_branches('remotes/origin');
+}
+expect pattern {
+    (?m)^Ada\nada@example\.com\n1\n[0-9a-f]{40}\n0\norigin\|mem://sql-vc-remotes-flow\|\["refs/heads/\*:refs/remotes/origin/\*"\]\|1\n0\n0\nremotes/origin/main\|seed$
+}
+
+test vc-remotes-errors-are-stable {
+    SELECT dolt_remote();
+}
+expect error {
+    usage: dolt_remote\(action, name \[, url\]\)
+}
+
+test vc-remotes-refuse-network-urls {
+    SELECT dolt_remote('add', 'origin', 'https://example.com/db');
+}
+expect error {
+    failed to open remote \(URL must start with file:// or mem://\)
+}
+
+test vc-remotes-creds-unlock-auth {
+    SELECT length(dolt_creds_new());
+    SELECT dolt_creds() <> '';
+}
+expect {
+    64
+    1
+}
