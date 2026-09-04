@@ -69,7 +69,7 @@ pub struct VcStore {
     pub(crate) head: String,
     pub(crate) branches: HashSet<String>,
     detached: Option<CommitId>,
-    staging: StagingSet,
+    pub(crate) staging: StagingSet,
     /// Transient conflict rows. Never written into a commit, never durable.
     pub(crate) conflicts: Vec<ConflictEntry>,
     /// Detected constraint violations over the working set.
@@ -94,9 +94,9 @@ pub struct VcStore {
     /// Tables the last `dolt_commit` wrote, so the glue can capture their SQL
     /// content into the new commit's snapshots.
     pub(crate) last_commit_tables: Vec<String>,
-    config: HashMap<String, String>,
-    tables: HashSet<String>,
-    states: HashMap<String, TableState>,
+    pub(crate) config: HashMap<String, String>,
+    pub(crate) tables: HashSet<String>,
+    pub(crate) states: HashMap<String, TableState>,
     pub(crate) snapshots: HashMap<CommitId, HashMap<String, TableSnapshot>>,
     pending_drops: HashSet<String>,
     /// Content-id index over the snapshot records, so remote sync and lazy
@@ -988,7 +988,7 @@ impl VcRead for VcStore {
 ///
 /// A table lives in at most one set at a time: `stage` moves it from working
 /// to staged, `unstage` moves it back, `discard` drops it from both.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct StagingSet {
     working: HashSet<String>,
     staged: HashSet<String>,

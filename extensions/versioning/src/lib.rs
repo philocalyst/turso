@@ -34,6 +34,7 @@ pub mod remote;
 pub mod remote_transport;
 pub mod remote_wire;
 pub mod replay;
+pub mod orm;
 pub mod session;
 pub mod source;
 pub mod staging;
