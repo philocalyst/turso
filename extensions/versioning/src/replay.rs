@@ -1609,10 +1609,11 @@ mod tests {
             "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, extra TEXT)".to_string(),
         );
         commit_work(&mut s, "feature work");
-        // Main drops the table and creates a commit without "t", so the
-        // merge base (seed) has "t" but main's HEAD snapshot does not.
+        // Main drops the table and commits: the deletion is an explicit
+        // drop_table, so the merge base (seed) has "t" but main's HEAD
+        // snapshot does not.
         s.checkout("main").unwrap();
-        s.work.remove("t");
+        s.drop_table("t").unwrap();
         // Add a dummy table so there's something to commit.
         s.apply_work(
             "dummy",

@@ -96,6 +96,7 @@ pub struct VcStore {
     tables: HashSet<String>,
     states: HashMap<String, TableState>,
     pub(crate) snapshots: HashMap<CommitId, HashMap<String, TableSnapshot>>,
+    pending_drops: HashSet<String>,
     now: i64,
 }
 
@@ -123,6 +124,7 @@ impl VcStore {
             tables: HashSet::new(),
             states: HashMap::new(),
             snapshots: HashMap::new(),
+            pending_drops: HashSet::new(),
             now: 0,
         }
     }
@@ -256,6 +258,19 @@ impl VcStore {
     pub fn track_table(&mut self, name: &str) {
         self.tables.insert(name.to_string());
         self.staging.stage_working(name);
+        self.pending_drops.remove(name);
+    }
+
+    /// Remove a table from version control: the next commit records the
+    /// deletion by dropping the table from its snapshot, so a merge against a
+    /// side that still has the table sees a real deletion.
+    pub fn drop_table(&mut self, name: &str) -> VersionResult<()> {
+        self.guard_write()?;
+        self.tables.remove(name);
+        self.work.remove(name);
+        self.staging.discard(name);
+        self.pending_drops.insert(name.to_string());
+        Ok(())
     }
 
     pub fn tables(&self) -> Vec<String> {
