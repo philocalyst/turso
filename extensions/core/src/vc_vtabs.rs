@@ -57,6 +57,8 @@ pub fn register_vc_vtabs(api: &ExtensionApi) {
         DoltMergeStatusModule::register_DoltMergeStatusModule(api);
         DoltConflictsModule::register_DoltConflictsModule(api);
         DoltConstraintViolationsModule::register_DoltConstraintViolationsModule(api);
+        DoltBranchesModule::register_DoltBranchesModule(api);
+        DoltTagsModule::register_DoltTagsModule(api);
     }
 }
 
@@ -251,6 +253,8 @@ enum VcKind {
     MergeStatus,
     Conflicts,
     Violations,
+    Branches,
+    Tags,
     HistoryT,
     AtT,
     BlameT,
@@ -403,6 +407,8 @@ fn build_rows(
         VcKind::MergeStatus => build_merge_status(state),
         VcKind::Conflicts => build_conflicts(state, idx_num, args),
         VcKind::Violations => build_violations(state, idx_num, args),
+        VcKind::Branches => build_branches(state, conn),
+        VcKind::Tags => build_tags(state),
         VcKind::HistoryT => build_history_t(state, table, idx_str, args),
         VcKind::AtT => build_at_t(state, table, idx_str, args),
         VcKind::BlameT => build_blame_t(state, table, idx_str, args),
@@ -717,6 +723,48 @@ fn build_merge_status(state: Option<Arc<VcState>>) -> Result<Vec<Vec<Cell>>, Str
                     text(r.state),
                 ]
             })
+            .collect())
+    })
+}
+
+fn build_branches(
+    state: Option<Arc<VcState>>,
+    conn: Option<Arc<Connection>>,
+) -> Result<Vec<Vec<Cell>>, String> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    // `dirty` mirrors the SQL tables, so refresh the working set before the
+    // scan reports cleanliness. Failures read as a clean tree rather than an
+    // error: the listing itself stays useful.
+    if conn.is_some() {
+        let _ = state.sync_sql_to_work();
+    }
+    state.with_store(|store| {
+        Ok(turso_versioning::vtab_refs::branches_rows(store)
+            .into_iter()
+            .map(|r| {
+                vec![
+                    text(r.name),
+                    text(r.hash),
+                    text(r.latest_commit_message),
+                    text(r.remote),
+                    int(r.branch as i64),
+                    int(r.dirty as i64),
+                ]
+            })
+            .collect())
+    })
+}
+
+fn build_tags(state: Option<Arc<VcState>>) -> Result<Vec<Vec<Cell>>, String> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    state.with_store(|store| {
+        Ok(turso_versioning::vtab_refs::tags_rows(store)
+            .into_iter()
+            .map(|r| vec![text(r.tag_name), text(r.tag_hash), text(r.message)])
             .collect())
     })
 }
@@ -1543,6 +1591,79 @@ impl VTable for DoltMergeStatusTable {
 
 #[derive(Debug, VTabModuleDerive, Default)]
 struct DoltConflictsModule;
+
+#[derive(Debug, VTabModuleDerive, Default)]
+struct DoltBranchesModule;
+
+impl VTabModule for DoltBranchesModule {
+    type Table = DoltBranchesTable;
+    const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+    const NAME: &'static str = "dolt_branches";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        Ok((
+            turso_versioning::vtab_refs::DOLT_BRANCHES_SCHEMA.to_string(),
+            DoltBranchesTable,
+        ))
+    }
+}
+
+struct DoltBranchesTable;
+
+impl VTable for DoltBranchesTable {
+    type Cursor = VcCursor;
+    type Error = String;
+
+    fn open(&self, conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        VcTable {
+            kind: VcKind::Branches,
+        }
+        .open(conn)
+    }
+
+    fn best_index(
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let plan = plan_equality(&vc_constraints(constraints), 0, 8);
+        Ok(index_info(&plan, constraints.len()))
+    }
+}
+
+#[derive(Debug, VTabModuleDerive, Default)]
+struct DoltTagsModule;
+
+impl VTabModule for DoltTagsModule {
+    type Table = DoltTagsTable;
+    const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+    const NAME: &'static str = "dolt_tags";
+
+    fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+        Ok((
+            turso_versioning::vtab_refs::DOLT_TAGS_SCHEMA.to_string(),
+            DoltTagsTable,
+        ))
+    }
+}
+
+struct DoltTagsTable;
+
+impl VTable for DoltTagsTable {
+    type Cursor = VcCursor;
+    type Error = String;
+
+    fn open(&self, conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+        VcTable { kind: VcKind::Tags }.open(conn)
+    }
+
+    fn best_index(
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let plan = plan_equality(&vc_constraints(constraints), 0, 8);
+        Ok(index_info(&plan, constraints.len()))
+    }
+}
 
 impl VTabModule for DoltConflictsModule {
     type Table = DoltConflictsTable;
