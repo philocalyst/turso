@@ -162,7 +162,12 @@ impl VcStore {
         let refs_blob = transport.get_refs()?;
         let refs = crate::remote_wire::decode_refs(&refs_blob)?;
         for (name, tip) in &refs.branches {
-            if !lazy {
+            if lazy {
+                // The catalog is the id closure only: bytes stay remote
+                // until a read needs them.
+                let ids = transport.walk(*tip)?;
+                self.note_lazy_catalog(*tip, ids);
+            } else {
                 self.fetch_closure(transport.as_ref(), *tip)?;
             }
             self.refs.set(&RefName::branch(name), *tip);
@@ -238,21 +243,7 @@ impl VcStore {
     /// Store one verified remote object (commits land in the commit map,
     /// snapshot records under their owner commit and table).
     fn store_remote_object(&mut self, id: &SourceId, bytes: &[u8]) -> VersionResult<()> {
-        // Ownership of the maps moves out while store_object runs: it needs
-        // `&mut` views of both, which the borrow checker cannot split here.
-        let mut commits = std::mem::take(&mut self.commits);
-        let mut snapshots = std::mem::take(&mut self.snapshots);
-        let result = store_object(&mut commits, &mut snapshots, id, bytes);
-        if result.is_ok() {
-            if let SourceId::Snapshot(snap) = id {
-                if let Ok((commit, table, _)) = crate::remote_wire::decode_snapshot_record(bytes) {
-                    self.snap_index.insert(*snap, (commit, table));
-                }
-            }
-        }
-        self.commits = commits;
-        self.snapshots = snapshots;
-        result
+        store_remote_object_on(self, id, bytes)
     }
 
     /// Download and verify every object of `tip`'s closure this store
@@ -278,6 +269,30 @@ impl VcStore {
     fn clone_fresh(&self) -> bool {
         self.commit_entries().is_empty() && self.remotes.is_empty() && self.tables().is_empty()
     }
+}
+
+/// The store-mutation half of object ingest, shared with the lazy source
+/// path. Callers verify bytes first (B4).
+pub(crate) fn store_remote_object_on(
+    store: &mut VcStore,
+    id: &SourceId,
+    bytes: &[u8],
+) -> VersionResult<()> {
+    // Ownership of the maps moves out while store_object runs: it needs
+    // `&mut` views of both, which the borrow checker cannot split here.
+    let mut commits = std::mem::take(&mut store.commits);
+    let mut snapshots = std::mem::take(&mut store.snapshots);
+    let result = store_object(&mut commits, &mut snapshots, id, bytes);
+    if result.is_ok() {
+        if let SourceId::Snapshot(snap) = id {
+            if let Ok((commit, table, _)) = crate::remote_wire::decode_snapshot_record(bytes) {
+                store.snap_index.insert(*snap, (commit, table));
+            }
+        }
+    }
+    store.commits = commits;
+    store.snapshots = snapshots;
+    result
 }
 
 #[cfg(test)]

@@ -10,6 +10,8 @@ use crate::conflicts::ConflictEntry;
 use crate::constraints::{MergedWork, Violation};
 use crate::model::{CommitId, RootHash, VersionError, VersionResult};
 use crate::refs::{MemRefStore, RefError, RefName, RefStore};
+use crate::remote::RemoteConfig;
+use crate::remote_wire::SnapshotId;
 use crate::vtab_log::{VcCommitView, VcRead, VcRow, VcValue};
 
 /// Lifecycle state a table can report through `dolt_status`.
@@ -64,8 +66,8 @@ pub struct TableSnapshot {
 pub struct VcStore {
     pub(crate) commits: MemCommitStore,
     pub(crate) refs: MemRefStore,
-    head: String,
-    branches: HashSet<String>,
+    pub(crate) head: String,
+    pub(crate) branches: HashSet<String>,
     detached: Option<CommitId>,
     staging: StagingSet,
     /// Transient conflict rows. Never written into a commit, never durable.
@@ -97,6 +99,23 @@ pub struct VcStore {
     states: HashMap<String, TableState>,
     pub(crate) snapshots: HashMap<CommitId, HashMap<String, TableSnapshot>>,
     pending_drops: HashSet<String>,
+    /// Content-id index over the snapshot records, so remote sync and lazy
+    /// misses can ask "is this object local?" without re-hashing every
+    /// snapshot.
+    pub(crate) snap_index: HashMap<SnapshotId, (CommitId, String)>,
+    /// Configured remotes (name -> url).
+    pub(crate) remotes: Vec<RemoteConfig>,
+    /// Remote-tracking refs: (remote, branch) -> last fetched tip.
+    pub(crate) tracking: std::collections::BTreeMap<(String, String), CommitId>,
+    /// The origin URL of a lazy clone; commits and snapshots fetch on
+    /// demand until the store materializes.
+    pub(crate) lazy_origin: Option<String>,
+    /// Object closures (ids only) behind each lazy tip, captured at clone
+    /// time so hydration knows what to ask the origin for.
+    pub(crate) lazy_catalog: HashMap<CommitId, Vec<crate::remote_wire::SourceId>>,
+    /// Whether the SQL session is inside an explicit BEGIN block (the gc
+    /// exclusivity gate reads this).
+    in_txn: bool,
     now: i64,
 }
 
@@ -125,6 +144,12 @@ impl VcStore {
             states: HashMap::new(),
             snapshots: HashMap::new(),
             pending_drops: HashSet::new(),
+            snap_index: HashMap::new(),
+            remotes: Vec::new(),
+            tracking: std::collections::BTreeMap::new(),
+            lazy_origin: None,
+            lazy_catalog: HashMap::new(),
+            in_txn: false,
             now: 0,
         }
     }
@@ -650,6 +675,17 @@ impl VcStore {
         rows: Vec<VcRow>,
         schema_sql: String,
     ) {
+        let (id, _) = crate::remote_wire::encode_snapshot_record(
+            &at,
+            table,
+            &TableSnapshot {
+                columns: columns.clone(),
+                pk: pk.clone(),
+                rows: rows.clone(),
+                schema_sql: schema_sql.clone(),
+            },
+        );
+        self.snap_index.insert(id, (at, table.to_string()));
         self.snapshots.entry(at).or_default().insert(
             table.to_string(),
             TableSnapshot {
@@ -716,14 +752,28 @@ impl VcStore {
             Revision::Staged if !self.staging.staged_tables().is_empty() => Ok(staged_id()),
             _ => {
                 let head = self.detached.or_else(|| self.head_commit());
-                crate::commit::resolve_revision(
+                match crate::commit::resolve_revision(
                     &self.commits,
                     &self.refs,
                     revision,
                     head,
                     None,
                     None,
-                )
+                ) {
+                    // `remotes/<remote>/<branch>` resolves through the
+                    // tracking map the way doltlite resolves remote refs.
+                    Err(VersionError::BranchNotFound(name)) if name.starts_with("remotes/") => {
+                        match name.strip_prefix("remotes/").and_then(|rest| {
+                            rest.split_once('/').and_then(|(remote, branch)| {
+                                self.tracking.get(&(remote.to_string(), branch.to_string()))
+                            })
+                        }) {
+                            Some(id) => Ok(*id),
+                            None => Err(VersionError::BranchNotFound(name)),
+                        }
+                    }
+                    other => other,
+                }
             }
         }
     }
@@ -744,6 +794,62 @@ impl VcStore {
     /// #592–#616); only ROLLBACK TO rewinds staging to the savepoint state.
     pub fn preserve_staging_on(&self, event: &str) -> bool {
         matches!(event, "COMMIT" | "ROLLBACK" | "RELEASE")
+    }
+
+    /// SQL transaction events: BEGIN enters, COMMIT/ROLLBACK leaves. The
+    /// gc exclusivity gate refuses to run mid-transaction.
+    pub fn note_txn_event(&mut self, event: &str) {
+        match event {
+            "BEGIN" => self.in_txn = true,
+            "COMMIT" | "ROLLBACK" => self.in_txn = false,
+            _ => {}
+        }
+    }
+
+    /// Whether the SQL session is inside an explicit BEGIN block.
+    pub fn in_txn(&self) -> bool {
+        self.in_txn
+    }
+
+    /// Uncommitted work in either working or staged form.
+    pub(crate) fn has_uncommitted(&self) -> bool {
+        !self.staging.working_tables().is_empty() || self.staging.has_staged()
+    }
+
+    /// The gc exclusivity gate: no open transaction, no uncommitted work,
+    /// no open merge/rebase/conflicts.
+    pub(crate) fn gc_quiet(&self) -> bool {
+        !self.in_txn
+            && !self.has_uncommitted()
+            && self.conflicts.is_empty()
+            && self.rebase_state.is_none()
+            && self.merge_state.is_none()
+    }
+
+    /// The remote-tracking ref map, for the remote-branches vtab.
+    pub fn tracking_refs(&self) -> Vec<((String, String), CommitId)> {
+        self.tracking
+            .iter()
+            .map(|(k, v)| ((k.0.clone(), k.1.clone()), *v))
+            .collect()
+    }
+
+    /// Configured remotes, for the remotes vtab.
+    pub fn remote_configs(&self) -> &[RemoteConfig] {
+        &self.remotes
+    }
+
+    /// The origin URL a lazy clone records, if this store is lazy.
+    pub fn lazy_origin(&self) -> Option<&str> {
+        self.lazy_origin.as_deref()
+    }
+
+    /// Look up one commit's snapshot record id for a table.
+    pub fn snapshot_id_of(&self, commit: &CommitId, table: &str) -> Option<SnapshotId> {
+        self.snap_index
+            .iter()
+            .find(|(_, (owner, name))| owner == commit && name == table)
+            .map(|(id, _)| *id)
     }
 }
 
