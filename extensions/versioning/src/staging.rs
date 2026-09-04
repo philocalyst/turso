@@ -478,6 +478,11 @@ impl VcStore {
         // absence as deletion, so inheriting untouched tables keeps a partial
         // commit from reading as a mass delete.
         self.seed_snapshot_from_parent(id, parents.first().copied());
+        for table in std::mem::take(&mut self.pending_drops) {
+            if let Some(snapshot) = self.snapshots.get_mut(&id) {
+                snapshot.remove(&table);
+            }
+        }
         // Record the working content under the new commit so the committed
         // snapshots carry rows for history/at/diff reads. Tables the glue
         // captures separately overwrite these through `record_snapshot`.

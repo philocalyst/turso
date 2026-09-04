@@ -30,6 +30,7 @@ pub mod merge;
 pub mod merge_schema;
 pub mod model;
 pub mod refs;
+pub mod remote;
 pub mod remote_transport;
 pub mod remote_wire;
 pub mod replay;

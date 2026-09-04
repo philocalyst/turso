@@ -92,7 +92,7 @@ impl MemEndpoint {
     }
 }
 
-fn hub() -> &'static Mutex<HashMap<String, MemEndpoint>> {
+pub(crate) fn hub() -> &'static Mutex<HashMap<String, MemEndpoint>> {
     static HUB: OnceLock<Mutex<HashMap<String, MemEndpoint>>> = OnceLock::new();
     HUB.get_or_init(|| Mutex::new(HashMap::new()))
 }
