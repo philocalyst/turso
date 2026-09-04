@@ -352,12 +352,38 @@ impl VcStore {
         Ok(())
     }
 
-    /// S1: stage everything, including new tables.
+    /// S1: stage everything, including new tables. A table counts as changed
+    /// when its working content differs from the committed head snapshot, so
+    /// `-A` keeps staging modifications made after earlier commits.
     pub fn add_all(&mut self) -> VersionResult<()> {
         self.guard_write()?;
-        let all = self.staging.working_tables();
+        let all = self.changed_tables();
         self.staging.stage_all(&all);
         Ok(())
+    }
+
+    /// Tracked tables with uncommitted changes: content that differs from the
+    /// head snapshot, or a table the head has never committed. This is the
+    /// `dolt_add('-A')` / `dolt_commit('-A')` staging source.
+    pub fn changed_tables(&self) -> Vec<String> {
+        let committed = self.head_commit().and_then(|id| self.snapshots.get(&id));
+        let untracked: Vec<String> = self.staging.working_tables();
+        let mut names: Vec<String> = self.tables.iter().cloned().collect();
+        names.sort();
+        names.retain(|name| {
+            if untracked.iter().any(|n| n == name) {
+                return true;
+            }
+            match (
+                self.work.get(name),
+                committed.and_then(|head| head.get(name)),
+            ) {
+                (Some(work), Some(head_snap)) => work != head_snap,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
+        });
+        names
     }
 
     /// S2: commit the staged set. Gates fire in doltlite's order: conflicts
@@ -383,8 +409,8 @@ impl VcStore {
             return Err(VersionError::Violations);
         }
         if all {
-            let working = self.staging.working_tables();
-            self.staging.stage_all(&working);
+            let changed = self.changed_tables();
+            self.staging.stage_all(&changed);
         }
         if !self.staging.has_staged() {
             return Err(VersionError::NothingToCommit);
@@ -523,6 +549,23 @@ impl VcStore {
         let mut names: Vec<String> = self.branches.iter().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Tip commit of a branch, `None` when the branch has no commits yet.
+    pub fn branch_tip(&self, name: &str) -> Option<CommitId> {
+        self.refs.get_branch(name)
+    }
+
+    /// Tag names with their commit, sorted by name.
+    pub fn list_tags(&self) -> Vec<(String, CommitId)> {
+        let mut tags: Vec<(String, CommitId)> = self
+            .refs
+            .list_tags()
+            .into_iter()
+            .map(|(name, at)| (name.name, at))
+            .collect();
+        tags.sort_by(|a, b| a.0.cmp(&b.0));
+        tags
     }
 
     /// R3: switch the session to another branch. Also reattaches a detached

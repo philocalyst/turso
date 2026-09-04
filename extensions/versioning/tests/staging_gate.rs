@@ -147,6 +147,34 @@ fn commit_refused_when_nothing_staged() {
 }
 
 #[test]
+fn add_all_stages_updates_after_first_commit() {
+    use turso_versioning::vtab_log::{VcRow, VcValue};
+    let mut s = configured_store();
+    s.apply_work(
+        "t1",
+        vec!["id".to_string(), "v".to_string()],
+        vec!["id".to_string()],
+        vec![VcRow::new(vec![
+            VcValue::Integer(1),
+            VcValue::Text("changed".into()),
+        ])],
+        String::new(),
+    );
+    s.add_all().unwrap();
+    s.set_now(2);
+    let id = s.dolt_commit("update", None, false, false).unwrap();
+    assert_eq!(s.head_commit(), Some(id), "second commit must land");
+}
+
+#[test]
+fn add_all_without_changes_stages_nothing() {
+    let mut s = configured_store();
+    s.add_all().unwrap();
+    let err = s.dolt_commit("empty", None, false, false).unwrap_err();
+    assert_eq!(err, VersionError::NothingToCommit);
+}
+
+#[test]
 fn commit_requires_author() {
     let mut s = VcStore::new("main");
     s.track_table("t1");

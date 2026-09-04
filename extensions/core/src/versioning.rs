@@ -295,7 +295,6 @@ macro_rules! vc_shim {
 
 // All store-backed functions take `&mut VcStore`; guard_write runs inside the
 // store methods, so read-only and mutating calls share one shim shape.
-vc_shim!(dolt_add_shim, funcs::dolt_add);
 vc_shim!(dolt_branch_shim, funcs::dolt_branch);
 vc_shim!(dolt_tag_shim, funcs::dolt_tag);
 vc_shim!(dolt_active_branch_shim, funcs::dolt_active_branch);
@@ -303,10 +302,44 @@ vc_shim!(dolt_hashof_shim, funcs::dolt_hashof);
 vc_shim!(dolt_hashof_table_shim, funcs::dolt_hashof_table);
 vc_shim!(dolt_hashof_db_shim, funcs::dolt_hashof_db);
 vc_shim!(dolt_config_shim, funcs::dolt_config);
-vc_shim!(dolt_status_shim, funcs::dolt_status);
 vc_shim!(dolt_reset_shim, funcs::dolt_reset);
 vc_shim!(dolt_clean_shim, funcs::dolt_clean);
 vc_shim!(dolt_merge_base_shim, funcs::dolt_merge_base);
+
+/// `dolt_add` and `dolt_status` observe the working set, which mirrors the
+/// SQL tables only at sync points. Sync first so `-A` sees writes made since
+/// the last commit and status never reports a stale clean tree.
+unsafe extern "C" fn dolt_add_shim(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    _cd: Option<ContextDestructor>,
+    _vd: Option<ValueDestructor>,
+) -> Value {
+    let state = unsafe { &*(context as *const VcState) };
+    if let Err(e) = state.sync_sql_to_work() {
+        return Value::error_with_message(e.to_string());
+    }
+    let args = args_slice(argc, argv);
+    let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+    dispatch(state, |store| funcs::dolt_add(store, &fargs))
+}
+
+unsafe extern "C" fn dolt_status_shim(
+    context: usize,
+    argc: i32,
+    argv: *const Value,
+    _cd: Option<ContextDestructor>,
+    _vd: Option<ValueDestructor>,
+) -> Value {
+    let state = unsafe { &*(context as *const VcState) };
+    if let Err(e) = state.sync_sql_to_work() {
+        return Value::error_with_message(e.to_string());
+    }
+    let args = args_slice(argc, argv);
+    let fargs: Vec<FuncArg> = args.iter().map(func_arg).collect();
+    dispatch(state, |store| funcs::dolt_status(store, &fargs))
+}
 
 /// A checkout switches the working set to the new branch's committed content,
 /// so the SQL tables rewrite to that branch's state before any capture.

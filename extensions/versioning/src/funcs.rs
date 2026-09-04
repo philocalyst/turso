@@ -97,9 +97,9 @@ impl VcOperations for crate::staging::VcStore {
     }
 
     fn add_all(&mut self) -> VersionResult<usize> {
-        let working = crate::staging::VcStore::working_tables(self);
+        let changed = crate::staging::VcStore::changed_tables(self);
         crate::staging::VcStore::add_all(self)?;
-        Ok(working.len())
+        Ok(changed.len())
     }
 
     fn commit(
