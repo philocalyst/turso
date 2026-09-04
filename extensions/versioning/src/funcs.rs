@@ -171,7 +171,8 @@ impl VcOperations for crate::staging::VcStore {
     }
 
     fn clean(&mut self) -> VersionResult<()> {
-        crate::staging::VcStore::clean(self)
+        let _ = crate::staging::VcStore::clean(self)?;
+        Ok(())
     }
 
     fn merge_branch(

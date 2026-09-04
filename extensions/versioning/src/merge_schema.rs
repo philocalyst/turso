@@ -1039,14 +1039,14 @@ mod tests {
     fn b1_no_base_added_on_theirs_only_takes_theirs() {
         let theirs = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
         let decision = merge_schema(None, None, Some(&theirs));
-        assert_eq!(decision, SchemaDecision::Clean(theirs.clone()));
+        assert_eq!(decision, SchemaDecision::Clean(theirs));
     }
 
     #[test]
     fn b1_no_base_added_on_ours_only_takes_ours() {
         let ours = ir("t", "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
         let decision = merge_schema(None, Some(&ours), None);
-        assert_eq!(decision, SchemaDecision::Clean(ours.clone()));
+        assert_eq!(decision, SchemaDecision::Clean(ours));
     }
 
     #[test]

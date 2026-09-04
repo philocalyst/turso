@@ -422,8 +422,8 @@ mod tests {
         );
         let _ = tables;
         collect_garbage(&mut store);
-        assert!(store.snapshots.get(&head).is_some());
-        assert!(store.snapshots.get(&orphan).is_none());
+        assert!(store.snapshots.contains_key(&head));
+        assert!(!store.snapshots.contains_key(&orphan));
     }
 
     #[test]

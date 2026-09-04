@@ -336,7 +336,7 @@ mod tests {
     fn source_materialize_clears_lazy_origin() {
         let (owner, tip) = commit_with_snapshot(6, 1);
         // Serve through a mem endpoint so OriginSource can reach it.
-        let transport = crate::remote_transport::MemTransport::open("src-mat-1", false).unwrap();
+        let _transport = crate::remote_transport::MemTransport::open("src-mat-1", false).unwrap();
         let mut pusher = owner;
         pusher.remote_add("origin", "mem://src-mat-1").unwrap();
         pusher.push("origin", "main", false).unwrap();

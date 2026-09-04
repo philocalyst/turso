@@ -388,9 +388,9 @@ mod tests {
 
     fn snap(columns: &[&str], pk: &[&str], rows: Vec<Vec<VcValue>>) -> TableSnapshot {
         TableSnapshot {
-            columns: columns.iter().map(|s| s.to_string()).collect(),
-            pk: pk.iter().map(|s| s.to_string()).collect(),
-            rows: rows.into_iter().map(|values| VcRow::new(values)).collect(),
+            columns: columns.iter().copied().map(str::to_owned).collect(),
+            pk: pk.iter().copied().map(str::to_owned).collect(),
+            rows: rows.into_iter().map(VcRow::new).collect(),
             schema_sql: format!(
                 "CREATE TABLE t ({})",
                 columns
@@ -459,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn wire_refs_roundtrip_and_sorted() {
         let refs = RemoteRefs {
             default_branch: "main".to_string(),
@@ -477,6 +478,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn wire_refs_rejects_corruption() {
         let refs = RemoteRefs {
             default_branch: "main".to_string(),
@@ -496,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn wire_verify_object_accepts_commit_and_snapshot() {
         let commit = crate::commit::Commit {
             parents: vec![],
@@ -531,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn wire_store_object_places_commits_and_snapshots() {
         let mut commits = crate::commit::MemCommitStore::new();
         let mut snapshots = std::collections::HashMap::new();
@@ -545,16 +549,13 @@ mod tests {
             },
         };
         let cid = commits.put_commit(commit.clone());
-        assert_eq!(
-            store_object(
-                &mut commits,
-                &mut snapshots,
-                &SourceId::Commit(cid),
-                &encode_v2(&commit)
-            )
-            .unwrap(),
-            ()
-        );
+        store_object(
+            &mut commits,
+            &mut snapshots,
+            &SourceId::Commit(cid),
+            &encode_v2(&commit),
+        )
+        .unwrap();
 
         let owner = CommitId([0x77; 20]);
         let s = snap(&["id"], &["id"], vec![row(1, "a")]);

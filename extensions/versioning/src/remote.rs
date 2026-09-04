@@ -33,6 +33,7 @@ pub fn normalize_remote_name(raw: &str) -> VersionResult<String> {
 /// The object closure of one tip: object ids, their bytes, and per-commit
 /// snapshot lists a remote needs to serve later walks.
 struct Closure {
+    #[allow(dead_code)]
     ids: Vec<SourceId>,
     objects: Vec<(SourceId, Vec<u8>)>,
     snap_lists: Vec<(CommitId, Vec<SnapshotId>)>,
@@ -298,8 +299,6 @@ pub(crate) fn store_remote_object_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commit::CommitStore;
-    use crate::staging::TableSnapshot;
     use crate::vtab_log::{VcRow, VcValue};
 
     /// A transport wrapper that counts object transfers, so tests can pin
@@ -465,7 +464,7 @@ mod tests {
             .inner
             .update_branch("main", store.head_commit().unwrap(), true)
             .unwrap();
-        let mut store2 = seeded_store("rt-push2b", &[(&1, "a")]);
+        let store2 = seeded_store("rt-push2b", &[(&1, "a")]);
         let _ = store2;
         // Count on the shared endpoint: second push of identical content.
         let mut again = seeded_store("rt-push2c", &[(&1, "a")]);

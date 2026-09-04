@@ -150,7 +150,7 @@ mod tests {
         assert_ne!(a.kid, b.kid);
         // Issuing activates the newest credential.
         assert_eq!(store.active().as_deref(), Some(b.kid.as_str()));
-        assert_eq!(store.list(), vec![a.kid.clone(), b.kid.clone()]);
+        assert_eq!(store.list(), vec![a.kid, b.kid]);
     }
 
     #[test]

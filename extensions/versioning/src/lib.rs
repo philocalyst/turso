@@ -35,6 +35,7 @@ pub mod remote_transport;
 pub mod remote_wire;
 pub mod replay;
 pub mod session;
+pub mod source;
 pub mod staging;
 pub mod store;
 pub mod vtab_diff;

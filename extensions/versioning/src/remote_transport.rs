@@ -790,7 +790,7 @@ mod tests {
         // Corrupt the refs file: the trailing hash no longer matches.
         let refs_path = dir.path().join("refs");
         let raw = std::fs::read(&refs_path).unwrap();
-        let mut bad = raw.clone();
+        let mut bad = raw;
         let last = bad.len() - 1;
         bad[last] ^= 0xFF;
         std::fs::write(&refs_path, bad).unwrap();

@@ -571,10 +571,22 @@ impl VcStore {
 
     /// S3: `dolt_clean` — drop untracked tables only. A tracked table stays
     /// even when it is modified and sitting in the working set.
-    pub fn clean(&mut self) -> VersionResult<()> {
+    pub fn clean(&mut self) -> VersionResult<Vec<String>> {
         self.guard_write()?;
+        let before_working = self.staging.working_tables();
+        let before_staged = self.staging.staged_tables();
+        let mut dropped: Vec<String> = before_working
+            .into_iter()
+            .chain(before_staged)
+            .filter(|t| !self.tables.contains(t))
+            .collect();
+        dropped.sort();
+        dropped.dedup();
         self.staging.discard_untracked(&self.tables);
-        Ok(())
+        for t in &dropped {
+            self.work.remove(t);
+        }
+        Ok(dropped)
     }
 
     pub fn config_get(&self, key: &str) -> Option<String> {
@@ -1003,6 +1015,10 @@ impl StagingSet {
     pub fn discard(&mut self, table: &str) {
         self.staged.remove(table);
         self.working.remove(table);
+    }
+
+    pub fn is_staged(&self, table: &str) -> bool {
+        self.staged.contains(table)
     }
 
     /// Insert directly into the working set without staging. Used by the
